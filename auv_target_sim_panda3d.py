@@ -18,38 +18,26 @@ from panda3d.core import (
     WindowProperties,
 )
 
-from environment3d import Environment3D, SphereObstacle
+from environment3d import Environment3D
 
 
 class AUVTargetSim(ShowBase):
     """Simple Panda3D baseline for an AUV reaching a target in a 3D volume.
 
+    Environment sizing, obstacle policies, and spawn policies are centralized
+    in ``environment3d.py``. This script keeps only AUV-/guidance-related
+    parameters plus Panda3D scene logic.
+
     Coordinate convention:
     - X: left/right
     - Y: forward/backward (Panda3D forward axis)
     - Z: up/down
-
-    Obstacle modes:
-    - Manual count mode: set ``self.obstacle_count`` to an integer.
-    - Complexity mode  : set ``self.obstacle_count = None`` and choose
-      ``self.obstacle_complexity`` in [0, 1].
-
-    Complexity definition:
-        obstacle_complexity = total_obstacle_volume / environment_volume
     """
 
     def __init__(self) -> None:
         super().__init__()
 
-        # You can swap this for Environment3D() if you want to keep the exact
-        # 0~3 default cube from the uploaded file.
-        self.env = Environment3D.from_size(
-            size=(30.0, 30.0, 12.0),
-            origin=(-15.0, -15.0, 0.0),
-        )
-        self.rng = np.random.default_rng(7)
-
-        # Guidance / motion tuning parameters.
+        # AUV / guidance tuning parameters.
         self.capture_radius = 0.50
         self.max_speed = 6.0
         self.max_accel = 7.5
@@ -61,15 +49,15 @@ class AUVTargetSim(ShowBase):
         self.auv_radius = 0.65
         self.target_radius = 0.42
 
-        # Obstacle tuning.
-        self.obstacle_radius = 1.35
-        self.obstacle_count: int | None = None       # Set an int to override auto mode.
-        self.obstacle_complexity: float | None = 0.015
-        self.obstacle_clearance = 2.0 * self.auv_radius + 0.05
-        self.max_obstacle_attempts_per_obstacle = 1200
-        self.requested_obstacle_count = 0
-        self.requested_obstacle_complexity = 0.0
-        self.obstacle_mode = "complexity"
+        # Environment is now fully configured inside environment3d.py.
+        self.env = Environment3D.default()
+        self.rng = self.env.make_rng()
+        self.start_pos = self.env.default_start_position()
+        self.env.apply_configured_obstacles(
+            auv_radius=self.auv_radius,
+            rng=self.rng,
+            start_pos=self.start_pos,
+        )
 
         # State.
         self.velocity = Vec3(0, 0, 0)
@@ -78,16 +66,6 @@ class AUVTargetSim(ShowBase):
         self.trail_update_interval = 0.10
         self._trail_timer = 0.0
         self.trail_np = self.render.attachNewNode("auv-trail")
-
-        self.start_pos = np.array(
-            [
-                self.env.min_bound[0] + 2.0,
-                self.env.min_bound[1] + 2.0,
-                self.env.min_bound[2] + self.env.size[2] * 0.5,
-            ],
-            dtype=float,
-        )
-        self._generate_obstacles()
 
         self._configure_window()
         self.disableMouse()
@@ -134,7 +112,11 @@ class AUVTargetSim(ShowBase):
         min_b = self.env.min_bound
         max_b = self.env.max_bound
 
-        box_np = self._make_wire_box(min_b, max_b, thickness=2.0)
+        box_np = self._make_wire_box(
+            min_b,
+            max_b,
+            thickness=self.env.box_line_thickness,
+        )
         box_np.reparentTo(self.render)
         box_np.setColor(0.25, 0.80, 1.00, 1.0)
 
@@ -144,7 +126,7 @@ class AUVTargetSim(ShowBase):
             min_y=float(min_b[1]),
             max_y=float(max_b[1]),
             z=float(min_b[2]),
-            spacing=2.0,
+            spacing=self.env.grid_spacing,
         )
         grid_np.reparentTo(self.render)
         grid_np.setColor(0.10, 0.28, 0.38, 1.0)
@@ -222,41 +204,6 @@ class AUVTargetSim(ShowBase):
         self.accept("r", self.randomize_target)
         self.accept("c", self._reset_camera)
         self.accept("escape", self.userExit)
-
-    # ---------------------------------------------------------------------
-    # Obstacle setup
-    # ---------------------------------------------------------------------
-    def _generate_obstacles(self) -> None:
-        if self.obstacle_count is not None:
-            self.obstacle_mode = "count"
-            self.requested_obstacle_count = max(0, int(self.obstacle_count))
-            self.requested_obstacle_complexity = self.env.complexity_from_count(
-                radius=self.obstacle_radius,
-                count=self.requested_obstacle_count,
-            )
-        else:
-            self.obstacle_mode = "complexity"
-            requested_complexity = 0.0 if self.obstacle_complexity is None else float(self.obstacle_complexity)
-            if not 0.0 <= requested_complexity <= 1.0:
-                raise ValueError("obstacle_complexity must be between 0 and 1.")
-            self.requested_obstacle_complexity = requested_complexity
-            self.requested_obstacle_count = self.env.obstacle_count_from_complexity(
-                radius=self.obstacle_radius,
-                complexity=requested_complexity,
-            )
-
-        reserved_spheres = [
-            (self.start_pos, self.auv_radius + 1.75),
-        ]
-
-        self.env.generate_random_sphere_obstacles(
-            radius=self.obstacle_radius,
-            count=self.requested_obstacle_count,
-            rng=self.rng,
-            clearance=self.obstacle_clearance,
-            reserved_spheres=reserved_spheres,
-            max_attempts_per_obstacle=self.max_obstacle_attempts_per_obstacle,
-        )
 
     def _rebuild_obstacle_visuals(self) -> None:
         if hasattr(self, "obstacle_root_np"):
@@ -488,9 +435,9 @@ class AUVTargetSim(ShowBase):
         speed = self.velocity.length()
         status = "ARRIVED" if self.arrived else ("PAUSED" if self.paused else "RUNNING")
 
-        target_complexity_pct = 100.0 * self.requested_obstacle_complexity
+        target_complexity_pct = 100.0 * self.env.requested_obstacle_complexity
         actual_complexity_pct = 100.0 * self.env.obstacle_complexity
-        mode_suffix = "manual count" if self.obstacle_mode == "count" else "auto complexity"
+        mode_suffix = "manual count" if self.env.obstacle_mode == "count" else "auto complexity"
 
         self.hud_text.setText(
             "\n".join(
@@ -500,7 +447,7 @@ class AUVTargetSim(ShowBase):
                     f"Target  : ({target.getX():6.2f}, {target.getY():6.2f}, {target.getZ():5.2f})",
                     f"Distance: {distance:5.2f} m",
                     f"Speed   : {speed:5.2f} m/s",
-                    f"Obsts   : {len(self.env.obstacles):2d}/{self.requested_obstacle_count:2d}  (r={self.obstacle_radius:4.2f} m)",
+                    f"Obsts   : {len(self.env.obstacles):2d}/{self.env.requested_obstacle_count:2d}  (r={self.env.obstacle_radius:4.2f} m)",
                     f"ObsComp : {actual_complexity_pct:5.2f}% / {target_complexity_pct:5.2f}%  [{mode_suffix}]",
                 ]
             )
@@ -568,31 +515,11 @@ class AUVTargetSim(ShowBase):
     def randomize_target(self) -> None:
         current = self.auv_np.getPos(self.render)
         current_np = np.array([current.getX(), current.getY(), current.getZ()], dtype=float)
-
-        try:
-            point = self.env.random_free_point(
-                rng=self.rng,
-                boundary_clearance=max(self.target_radius + 0.35, 0.80),
-                obstacle_clearance=self.target_radius + 0.15,
-                reserved_spheres=[(current_np, 6.0)],
-                max_attempts=2000,
-            )
-        except RuntimeError:
-            point = self.env.center.copy()
-            point[2] = max(point[2], self.env.min_bound[2] + 0.80)
-            point = self.env.clamp(point)
-
-            if not self.env.is_point_obstacle_free(point, clearance=self.target_radius + 0.15):
-                for obstacle in self.env.obstacles:
-                    delta = point - obstacle.center
-                    distance = float(np.linalg.norm(delta))
-                    min_distance = obstacle.radius + self.target_radius + 0.20
-                    if distance < min_distance:
-                        if distance < 1e-8:
-                            delta = np.array([1.0, 0.0, 0.0], dtype=float)
-                            distance = 1.0
-                        point = obstacle.center + (delta / distance) * min_distance
-                point = self.env.clamp(point)
+        point = self.env.sample_target_point(
+            current_pos=current_np,
+            target_radius=self.target_radius,
+            rng=self.rng,
+        )
 
         candidate = Vec3(float(point[0]), float(point[1]), float(point[2]))
         self.target_np.setPos(self.render, candidate)

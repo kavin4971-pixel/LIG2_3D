@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
-import math
 
 import numpy as np
 
@@ -37,6 +38,94 @@ class SphereObstacle:
 
 
 @dataclass
+class ObstacleConfig:
+    """Parameters that control obstacle generation for the environment."""
+
+    radius: float = 1.35
+    count: int | None = None
+    complexity: float | None = 0.015
+    clearance_multiplier: float = 2.0
+    clearance_padding: float = 0.05
+    max_attempts_per_obstacle: int = 1200
+
+    def placement_clearance(self, agent_radius: float) -> float:
+        agent_radius = float(agent_radius)
+        if agent_radius < 0:
+            raise ValueError("agent_radius must be >= 0.")
+        return self.clearance_multiplier * agent_radius + self.clearance_padding
+
+
+@dataclass
+class SpawnConfig:
+    """Environment-owned defaults for start/goal sampling."""
+
+    start_offset_xy: tuple[float, float] = (2.0, 2.0)
+    start_height_ratio: float = 0.5
+    start_reserved_extra: float = 1.75
+    target_boundary_padding: float = 0.35
+    min_target_boundary_clearance: float = 0.80
+    target_obstacle_padding: float = 0.15
+    target_min_distance_from_agent: float = 6.0
+    target_max_attempts: int = 2000
+
+    def start_position(self, env: "Environment3D") -> np.ndarray:
+        point = np.array(
+            [
+                env.min_bound[0] + self.start_offset_xy[0],
+                env.min_bound[1] + self.start_offset_xy[1],
+                env.min_bound[2] + env.size[2] * self.start_height_ratio,
+            ],
+            dtype=float,
+        )
+        return env.clamp(point)
+
+    def start_reserved_radius(self, agent_radius: float) -> float:
+        agent_radius = float(agent_radius)
+        if agent_radius < 0:
+            raise ValueError("agent_radius must be >= 0.")
+        return agent_radius + self.start_reserved_extra
+
+    def target_boundary_clearance(self, target_radius: float) -> float:
+        target_radius = float(target_radius)
+        if target_radius < 0:
+            raise ValueError("target_radius must be >= 0.")
+        return max(target_radius + self.target_boundary_padding, self.min_target_boundary_clearance)
+
+    def target_obstacle_clearance(self, target_radius: float) -> float:
+        target_radius = float(target_radius)
+        if target_radius < 0:
+            raise ValueError("target_radius must be >= 0.")
+        return target_radius + self.target_obstacle_padding
+
+
+@dataclass
+class EnvironmentVisualConfig:
+    """Rendering-related constants for the environment scene."""
+
+    box_line_thickness: float = 2.0
+    grid_spacing: float = 2.0
+
+
+@dataclass
+class EnvironmentConfig:
+    """Single place where environment-related defaults live.
+
+    Edit this structure instead of scattering size, obstacle, and spawn tuning
+    inside the Panda3D application code.
+    """
+
+    size: tuple[float, float, float] = (30.0, 30.0, 12.0)
+    origin: tuple[float, float, float] = (-15.0, -15.0, 0.0)
+    random_seed: int | None = 7
+    obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
+    spawn: SpawnConfig = field(default_factory=SpawnConfig)
+    visual: EnvironmentVisualConfig = field(default_factory=EnvironmentVisualConfig)
+
+
+DEFAULT_ENVIRONMENT_CONFIG = EnvironmentConfig()
+
+
+@dataclass
 class Environment3D:
     min_bound: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 0.0, 0.0], dtype=float)
@@ -45,6 +134,10 @@ class Environment3D:
         default_factory=lambda: np.array([3.0, 3.0, 3.0], dtype=float)
     )
     obstacles: list[SphereObstacle] = field(default_factory=list)
+    config: EnvironmentConfig | None = None
+    requested_obstacle_count: int = 0
+    requested_obstacle_complexity: float = 0.0
+    obstacle_mode: str = "complexity"
 
     def __post_init__(self) -> None:
         self.min_bound = np.asarray(self.min_bound, dtype=float).reshape(3)
@@ -71,13 +164,32 @@ class Environment3D:
         size: VectorLike = (3.0, 3.0, 3.0),
         origin: VectorLike = (0.0, 0.0, 0.0),
     ) -> "Environment3D":
-        origin = np.asarray(origin, dtype=float).reshape(3)
-        size = np.asarray(size, dtype=float).reshape(3)
+        origin_arr = np.asarray(origin, dtype=float).reshape(3)
+        size_arr = np.asarray(size, dtype=float).reshape(3)
+
+        if np.any(size_arr <= 0):
+            raise ValueError("Each size value must be > 0.")
+
+        config = EnvironmentConfig(
+            size=tuple(map(float, size_arr.tolist())),
+            origin=tuple(map(float, origin_arr.tolist())),
+        )
+        return cls(min_bound=origin_arr, max_bound=origin_arr + size_arr, config=config)
+
+    @classmethod
+    def from_config(cls, config: EnvironmentConfig | None = None) -> "Environment3D":
+        cfg = copy.deepcopy(DEFAULT_ENVIRONMENT_CONFIG if config is None else config)
+        origin = np.asarray(cfg.origin, dtype=float).reshape(3)
+        size = np.asarray(cfg.size, dtype=float).reshape(3)
 
         if np.any(size <= 0):
             raise ValueError("Each size value must be > 0.")
 
-        return cls(min_bound=origin, max_bound=origin + size)
+        return cls(min_bound=origin, max_bound=origin + size, config=cfg)
+
+    @classmethod
+    def default(cls) -> "Environment3D":
+        return cls.from_config(DEFAULT_ENVIRONMENT_CONFIG)
 
     @property
     def size(self) -> np.ndarray:
@@ -100,6 +212,24 @@ class Environment3D:
         if self.volume <= 0:
             return 0.0
         return self.obstacle_volume / self.volume
+
+    @property
+    def obstacle_radius(self) -> float:
+        if self.config is None:
+            return 0.0
+        return float(self.config.obstacle.radius)
+
+    @property
+    def grid_spacing(self) -> float:
+        if self.config is None:
+            return 2.0
+        return float(self.config.visual.grid_spacing)
+
+    @property
+    def box_line_thickness(self) -> float:
+        if self.config is None:
+            return 2.0
+        return float(self.config.visual.box_line_thickness)
 
     @staticmethod
     def sphere_volume(radius: float) -> float:
@@ -156,6 +286,104 @@ class Environment3D:
 
     def clear_obstacles(self) -> None:
         self.obstacles.clear()
+
+    def make_rng(self) -> np.random.Generator:
+        seed = None
+        if self.config is not None:
+            seed = self.config.random_seed
+        return np.random.default_rng(seed)
+
+    def default_start_position(self) -> np.ndarray:
+        if self.config is None:
+            point = np.array(
+                [
+                    self.min_bound[0] + 2.0,
+                    self.min_bound[1] + 2.0,
+                    self.min_bound[2] + self.size[2] * 0.5,
+                ],
+                dtype=float,
+            )
+            return self.clamp(point)
+
+        return self.config.spawn.start_position(self)
+
+    def apply_configured_obstacles(
+        self,
+        *,
+        auv_radius: float,
+        rng: np.random.Generator | None = None,
+        start_pos: VectorLike | None = None,
+    ) -> list[SphereObstacle]:
+        if self.config is None:
+            self.requested_obstacle_count = 0
+            self.requested_obstacle_complexity = 0.0
+            self.obstacle_mode = "count"
+            self.clear_obstacles()
+            return []
+
+        obstacle_cfg = self.config.obstacle
+        spawn_cfg = self.config.spawn
+
+        if obstacle_cfg.count is not None:
+            self.obstacle_mode = "count"
+            self.requested_obstacle_count = max(0, int(obstacle_cfg.count))
+            self.requested_obstacle_complexity = self.complexity_from_count(
+                radius=obstacle_cfg.radius,
+                count=self.requested_obstacle_count,
+            )
+        else:
+            self.obstacle_mode = "complexity"
+            requested_complexity = 0.0 if obstacle_cfg.complexity is None else float(obstacle_cfg.complexity)
+            if not 0.0 <= requested_complexity <= 1.0:
+                raise ValueError("obstacle_complexity must be between 0 and 1.")
+            self.requested_obstacle_complexity = requested_complexity
+            self.requested_obstacle_count = self.obstacle_count_from_complexity(
+                radius=obstacle_cfg.radius,
+                complexity=requested_complexity,
+            )
+
+        start = self.default_start_position() if start_pos is None else np.asarray(start_pos, dtype=float).reshape(3)
+        reserved_spheres = [
+            (start, spawn_cfg.start_reserved_radius(auv_radius)),
+        ]
+
+        return self.generate_random_sphere_obstacles(
+            radius=obstacle_cfg.radius,
+            count=self.requested_obstacle_count,
+            rng=rng,
+            clearance=obstacle_cfg.placement_clearance(auv_radius),
+            reserved_spheres=reserved_spheres,
+            max_attempts_per_obstacle=obstacle_cfg.max_attempts_per_obstacle,
+        )
+
+    def sample_target_point(
+        self,
+        *,
+        current_pos: VectorLike,
+        target_radius: float,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        current = np.asarray(current_pos, dtype=float).reshape(3)
+        spawn_cfg = self.config.spawn if self.config is not None else SpawnConfig()
+
+        try:
+            point = self.random_free_point(
+                rng=rng,
+                boundary_clearance=spawn_cfg.target_boundary_clearance(target_radius),
+                obstacle_clearance=spawn_cfg.target_obstacle_clearance(target_radius),
+                reserved_spheres=[(current, spawn_cfg.target_min_distance_from_agent)],
+                max_attempts=spawn_cfg.target_max_attempts,
+            )
+        except RuntimeError:
+            point = self.center.copy()
+            point[2] = max(point[2], self.min_bound[2] + spawn_cfg.min_target_boundary_clearance)
+            point = self.push_point_out_of_obstacles(
+                point,
+                clearance=spawn_cfg.target_obstacle_clearance(target_radius) + 0.05,
+            )
+            point = self.clamp(point)
+
+        return point
 
     def is_sphere_inside(
         self,
@@ -240,6 +468,41 @@ class Environment3D:
             return point
 
         raise RuntimeError("Could not sample a free point in the current environment.")
+
+    def push_point_out_of_obstacles(
+        self,
+        point: VectorLike,
+        clearance: float = 0.0,
+        max_passes: int = 3,
+    ) -> np.ndarray:
+        point_arr = np.asarray(point, dtype=float).reshape(3).copy()
+        clearance = float(clearance)
+        if clearance < 0:
+            raise ValueError("clearance must be >= 0.")
+        if max_passes <= 0:
+            raise ValueError("max_passes must be > 0.")
+
+        for _ in range(max_passes):
+            adjusted = False
+            point_arr = self.clamp(point_arr)
+
+            for obstacle in self.obstacles:
+                delta = point_arr - obstacle.center
+                distance = float(np.linalg.norm(delta))
+                min_distance = obstacle.radius + clearance
+                if distance >= min_distance:
+                    continue
+
+                adjusted = True
+                if distance < 1e-8:
+                    delta = np.array([1.0, 0.0, 0.0], dtype=float)
+                    distance = 1.0
+                point_arr = obstacle.center + (delta / distance) * min_distance
+
+            if not adjusted:
+                break
+
+        return self.clamp(point_arr)
 
     def generate_random_sphere_obstacles(
         self,
