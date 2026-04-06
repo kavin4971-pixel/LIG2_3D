@@ -16,10 +16,14 @@ ReservedSphereLike = tuple[VectorLike, float]
 class SphereObstacle:
     center: np.ndarray
     radius: float
+    velocity: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=float)
+    )
 
     def __post_init__(self) -> None:
         self.center = np.asarray(self.center, dtype=float).reshape(3)
         self.radius = float(self.radius)
+        self.velocity = np.asarray(self.velocity, dtype=float).reshape(3)
 
         if self.radius <= 0:
             raise ValueError("Obstacle radius must be > 0.")
@@ -28,6 +32,10 @@ class SphereObstacle:
     def volume(self) -> float:
         return (4.0 / 3.0) * math.pi * (self.radius ** 3)
 
+    @property
+    def speed(self) -> float:
+        return float(np.linalg.norm(self.velocity))
+
     def contains(self, point: VectorLike, margin: float = 0.0) -> bool:
         p = np.asarray(point, dtype=float).reshape(3)
         return bool(np.linalg.norm(p - self.center) <= self.radius + float(margin))
@@ -35,6 +43,22 @@ class SphereObstacle:
     def signed_distance(self, point: VectorLike) -> float:
         p = np.asarray(point, dtype=float).reshape(3)
         return float(np.linalg.norm(p - self.center) - self.radius)
+
+
+@dataclass
+class ObstacleMotionConfig:
+    """Parameters that control obstacle motion after generation."""
+
+    enabled: bool = True
+    speed_ratio_to_auv_max: float = 0.10
+    target_clearance: float = 1.0
+    resolution_passes: int = 2
+
+    def speed_from_auv_max(self, auv_max_speed: float) -> float:
+        auv_max_speed = float(auv_max_speed)
+        if auv_max_speed < 0:
+            raise ValueError("auv_max_speed must be >= 0.")
+        return max(0.0, self.speed_ratio_to_auv_max * auv_max_speed)
 
 
 @dataclass
@@ -47,6 +71,7 @@ class ObstacleConfig:
     clearance_multiplier: float = 2.0
     clearance_padding: float = 0.05
     max_attempts_per_obstacle: int = 1200
+    motion: ObstacleMotionConfig = field(default_factory=ObstacleMotionConfig)
 
     def placement_clearance(self, agent_radius: float) -> float:
         agent_radius = float(agent_radius)
@@ -89,7 +114,10 @@ class SpawnConfig:
         target_radius = float(target_radius)
         if target_radius < 0:
             raise ValueError("target_radius must be >= 0.")
-        return max(target_radius + self.target_boundary_padding, self.min_target_boundary_clearance)
+        return max(
+            target_radius + self.target_boundary_padding,
+            self.min_target_boundary_clearance,
+        )
 
     def target_obstacle_clearance(self, target_radius: float) -> float:
         target_radius = float(target_radius)
@@ -110,8 +138,8 @@ class EnvironmentVisualConfig:
 class EnvironmentConfig:
     """Single place where environment-related defaults live.
 
-    Edit this structure instead of scattering size, obstacle, and spawn tuning
-    inside the Panda3D application code.
+    Edit this structure instead of scattering size, obstacle, spawn, and
+    obstacle-motion tuning inside the Panda3D application code.
     """
 
     size: tuple[float, float, float] = (30.0, 30.0, 12.0)
@@ -220,6 +248,16 @@ class Environment3D:
         return float(self.config.obstacle.radius)
 
     @property
+    def obstacle_motion(self) -> ObstacleMotionConfig:
+        if self.config is None:
+            return ObstacleMotionConfig(enabled=False)
+        return self.config.obstacle.motion
+
+    @property
+    def dynamic_obstacles_enabled(self) -> bool:
+        return bool(self.obstacle_motion.enabled)
+
+    @property
     def grid_spacing(self) -> float:
         if self.config is None:
             return 2.0
@@ -237,6 +275,60 @@ class Environment3D:
         if radius <= 0:
             raise ValueError("Sphere radius must be > 0.")
         return (4.0 / 3.0) * math.pi * (radius ** 3)
+
+    @staticmethod
+    def _vector_norm(vector: VectorLike) -> float:
+        return float(np.linalg.norm(np.asarray(vector, dtype=float).reshape(3)))
+
+    @staticmethod
+    def _safe_unit(
+        vector: VectorLike,
+        fallback: VectorLike | None = None,
+    ) -> np.ndarray:
+        vec = np.asarray(vector, dtype=float).reshape(3)
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-8:
+            return vec / norm
+
+        if fallback is None:
+            return np.array([1.0, 0.0, 0.0], dtype=float)
+
+        fallback_vec = np.asarray(fallback, dtype=float).reshape(3)
+        fallback_norm = float(np.linalg.norm(fallback_vec))
+        if fallback_norm > 1e-8:
+            return fallback_vec / fallback_norm
+
+        return np.array([1.0, 0.0, 0.0], dtype=float)
+
+    @staticmethod
+    def random_unit_vector(
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        rng = rng or np.random.default_rng()
+        while True:
+            vector = rng.normal(0.0, 1.0, size=3)
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-8:
+                return vector / norm
+
+    @classmethod
+    def random_unit_vector_in_hemisphere(
+        cls,
+        normal: VectorLike,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        rng = rng or np.random.default_rng()
+        surface_normal = cls._safe_unit(normal)
+
+        for _ in range(32):
+            direction = cls.random_unit_vector(rng)
+            if float(np.dot(direction, surface_normal)) >= 0.0:
+                return direction
+
+        direction = cls.random_unit_vector(rng)
+        if float(np.dot(direction, surface_normal)) < 0.0:
+            direction = -direction
+        return cls._safe_unit(direction, fallback=surface_normal)
 
     def obstacle_count_from_complexity(self, radius: float, complexity: float) -> int:
         radius = float(radius)
@@ -307,6 +399,42 @@ class Environment3D:
 
         return self.config.spawn.start_position(self)
 
+    def dynamic_obstacle_speed(self, auv_max_speed: float) -> float:
+        return self.obstacle_motion.speed_from_auv_max(auv_max_speed)
+
+    def target_obstacle_keepout_radius(self, target_radius: float) -> float:
+        target_radius = float(target_radius)
+        if target_radius < 0:
+            raise ValueError("target_radius must be >= 0.")
+
+        spawn_cfg = self.config.spawn if self.config is not None else SpawnConfig()
+        spawn_keepout = spawn_cfg.target_obstacle_clearance(target_radius)
+        motion_keepout = target_radius + max(0.0, self.obstacle_motion.target_clearance)
+        return max(spawn_keepout, motion_keepout)
+
+    def initialize_dynamic_obstacles(
+        self,
+        *,
+        auv_max_speed: float,
+        rng: np.random.Generator | None = None,
+    ) -> None:
+        if not self.dynamic_obstacles_enabled or not self.obstacles:
+            return
+
+        rng = rng or self.make_rng()
+        speed = self.dynamic_obstacle_speed(auv_max_speed)
+        if speed <= 0.0:
+            for obstacle in self.obstacles:
+                obstacle.velocity = np.zeros(3, dtype=float)
+            return
+
+        for obstacle in self.obstacles:
+            direction = self._safe_unit(
+                obstacle.velocity,
+                fallback=self.random_unit_vector(rng),
+            )
+            obstacle.velocity = direction * speed
+
     def apply_configured_obstacles(
         self,
         *,
@@ -333,7 +461,11 @@ class Environment3D:
             )
         else:
             self.obstacle_mode = "complexity"
-            requested_complexity = 0.0 if obstacle_cfg.complexity is None else float(obstacle_cfg.complexity)
+            requested_complexity = (
+                0.0
+                if obstacle_cfg.complexity is None
+                else float(obstacle_cfg.complexity)
+            )
             if not 0.0 <= requested_complexity <= 1.0:
                 raise ValueError("obstacle_complexity must be between 0 and 1.")
             self.requested_obstacle_complexity = requested_complexity
@@ -342,12 +474,16 @@ class Environment3D:
                 complexity=requested_complexity,
             )
 
-        start = self.default_start_position() if start_pos is None else np.asarray(start_pos, dtype=float).reshape(3)
+        start = (
+            self.default_start_position()
+            if start_pos is None
+            else np.asarray(start_pos, dtype=float).reshape(3)
+        )
         reserved_spheres = [
             (start, spawn_cfg.start_reserved_radius(auv_radius)),
         ]
 
-        return self.generate_random_sphere_obstacles(
+        obstacles = self.generate_random_sphere_obstacles(
             radius=obstacle_cfg.radius,
             count=self.requested_obstacle_count,
             rng=rng,
@@ -355,6 +491,7 @@ class Environment3D:
             reserved_spheres=reserved_spheres,
             max_attempts_per_obstacle=obstacle_cfg.max_attempts_per_obstacle,
         )
+        return obstacles
 
     def sample_target_point(
         self,
@@ -365,12 +502,13 @@ class Environment3D:
     ) -> np.ndarray:
         current = np.asarray(current_pos, dtype=float).reshape(3)
         spawn_cfg = self.config.spawn if self.config is not None else SpawnConfig()
+        keepout = self.target_obstacle_keepout_radius(target_radius)
 
         try:
             point = self.random_free_point(
                 rng=rng,
                 boundary_clearance=spawn_cfg.target_boundary_clearance(target_radius),
-                obstacle_clearance=spawn_cfg.target_obstacle_clearance(target_radius),
+                obstacle_clearance=keepout,
                 reserved_spheres=[(current, spawn_cfg.target_min_distance_from_agent)],
                 max_attempts=spawn_cfg.target_max_attempts,
             )
@@ -379,11 +517,94 @@ class Environment3D:
             point[2] = max(point[2], self.min_bound[2] + spawn_cfg.min_target_boundary_clearance)
             point = self.push_point_out_of_obstacles(
                 point,
-                clearance=spawn_cfg.target_obstacle_clearance(target_radius) + 0.05,
+                clearance=keepout + 0.05,
             )
             point = self.clamp(point)
 
         return point
+
+    def update_dynamic_obstacles(
+        self,
+        *,
+        dt: float,
+        auv_max_speed: float,
+        target_center: VectorLike | None = None,
+        target_radius: float = 0.0,
+        rng: np.random.Generator | None = None,
+    ) -> None:
+        dt = float(dt)
+        if dt < 0:
+            raise ValueError("dt must be >= 0.")
+        if not self.dynamic_obstacles_enabled or not self.obstacles:
+            return
+
+        rng = rng or self.make_rng()
+        speed = self.dynamic_obstacle_speed(auv_max_speed)
+        if speed <= 0.0:
+            for obstacle in self.obstacles:
+                obstacle.velocity = np.zeros(3, dtype=float)
+            return
+
+        self.initialize_dynamic_obstacles(auv_max_speed=auv_max_speed, rng=rng)
+
+        target_center_arr = None
+        target_keepout = 0.0
+        if target_center is not None:
+            target_center_arr = np.asarray(target_center, dtype=float).reshape(3)
+            target_keepout = self.target_obstacle_keepout_radius(target_radius)
+
+        for obstacle in self.obstacles:
+            obstacle.center = obstacle.center + obstacle.velocity * dt
+
+        collision_normals = [np.zeros(3, dtype=float) for _ in self.obstacles]
+        resolution_passes = max(1, int(self.obstacle_motion.resolution_passes))
+
+        for _ in range(resolution_passes):
+            adjusted_this_pass = False
+
+            for idx, obstacle in enumerate(self.obstacles):
+                adjusted, normal = self._resolve_obstacle_with_bounds(obstacle)
+                if adjusted:
+                    collision_normals[idx] += normal
+                    adjusted_this_pass = True
+
+            if target_center_arr is not None and target_keepout > 0.0:
+                for idx, obstacle in enumerate(self.obstacles):
+                    adjusted, normal = self._resolve_obstacle_with_target_zone(
+                        obstacle=obstacle,
+                        target_center=target_center_arr,
+                        keepout_radius=target_keepout,
+                        rng=rng,
+                    )
+                    if adjusted:
+                        collision_normals[idx] += normal
+                        adjusted_this_pass = True
+
+            for left_idx in range(len(self.obstacles) - 1):
+                for right_idx in range(left_idx + 1, len(self.obstacles)):
+                    adjusted, normal = self._resolve_obstacle_pair(
+                        self.obstacles[left_idx],
+                        self.obstacles[right_idx],
+                        rng=rng,
+                    )
+                    if adjusted:
+                        collision_normals[left_idx] += normal
+                        collision_normals[right_idx] -= normal
+                        adjusted_this_pass = True
+
+            if not adjusted_this_pass:
+                break
+
+        for idx, obstacle in enumerate(self.obstacles):
+            outward = collision_normals[idx]
+            if self._vector_norm(outward) > 1e-8:
+                new_direction = self.random_unit_vector_in_hemisphere(outward, rng=rng)
+                obstacle.velocity = new_direction * speed
+            else:
+                obstacle.velocity = self._safe_unit(
+                    obstacle.velocity,
+                    fallback=self.random_unit_vector(rng),
+                ) * speed
 
     def is_sphere_inside(
         self,
@@ -560,6 +781,74 @@ class Environment3D:
 
         self.obstacles = generated
         return list(self.obstacles)
+
+    def _resolve_obstacle_with_bounds(
+        self,
+        obstacle: SphereObstacle,
+    ) -> tuple[bool, np.ndarray]:
+        lower = self.min_bound + obstacle.radius
+        upper = self.max_bound - obstacle.radius
+        normal = np.zeros(3, dtype=float)
+        adjusted = False
+
+        for axis in range(3):
+            if obstacle.center[axis] < lower[axis]:
+                obstacle.center[axis] = lower[axis]
+                normal[axis] += 1.0
+                adjusted = True
+            elif obstacle.center[axis] > upper[axis]:
+                obstacle.center[axis] = upper[axis]
+                normal[axis] -= 1.0
+                adjusted = True
+
+        if not adjusted:
+            return False, normal
+        return True, self._safe_unit(normal)
+
+    def _resolve_obstacle_with_target_zone(
+        self,
+        *,
+        obstacle: SphereObstacle,
+        target_center: np.ndarray,
+        keepout_radius: float,
+        rng: np.random.Generator,
+    ) -> tuple[bool, np.ndarray]:
+        delta = obstacle.center - target_center
+        distance = float(np.linalg.norm(delta))
+        min_distance = obstacle.radius + float(keepout_radius)
+        if distance >= min_distance:
+            return False, np.zeros(3, dtype=float)
+
+        normal = self._safe_unit(
+            delta,
+            fallback=obstacle.velocity if obstacle.speed > 1e-8 else self.random_unit_vector(rng),
+        )
+        obstacle.center = target_center + normal * min_distance
+        return True, normal
+
+    def _resolve_obstacle_pair(
+        self,
+        left: SphereObstacle,
+        right: SphereObstacle,
+        *,
+        rng: np.random.Generator,
+    ) -> tuple[bool, np.ndarray]:
+        delta = left.center - right.center
+        distance = float(np.linalg.norm(delta))
+        min_distance = left.radius + right.radius
+        if distance >= min_distance:
+            return False, np.zeros(3, dtype=float)
+
+        fallback = left.velocity - right.velocity
+        if self._vector_norm(fallback) < 1e-8:
+            fallback = self.random_unit_vector(rng)
+        normal = self._safe_unit(delta, fallback=fallback)
+
+        overlap = min_distance - distance
+        correction = normal * (0.5 * overlap + 1e-6)
+        left.center = left.center + correction
+        right.center = right.center - correction
+        return True, normal
 
     @staticmethod
     def _normalize_reserved_spheres(

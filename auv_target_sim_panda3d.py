@@ -24,9 +24,9 @@ from environment3d import Environment3D
 class AUVTargetSim(ShowBase):
     """Simple Panda3D baseline for an AUV reaching a target in a 3D volume.
 
-    Environment sizing, obstacle policies, and spawn policies are centralized
-    in ``environment3d.py``. This script keeps only AUV-/guidance-related
-    parameters plus Panda3D scene logic.
+    Environment sizing, obstacle policies, spawn policies, and obstacle-motion
+    policies are centralized in ``environment3d.py``. This script keeps only
+    AUV-/guidance-related parameters plus Panda3D scene logic.
 
     Coordinate convention:
     - X: left/right
@@ -49,7 +49,7 @@ class AUVTargetSim(ShowBase):
         self.auv_radius = 0.65
         self.target_radius = 0.42
 
-        # Environment is now fully configured inside environment3d.py.
+        # Environment is configured inside environment3d.py.
         self.env = Environment3D.default()
         self.rng = self.env.make_rng()
         self.start_pos = self.env.default_start_position()
@@ -57,6 +57,10 @@ class AUVTargetSim(ShowBase):
             auv_radius=self.auv_radius,
             rng=self.rng,
             start_pos=self.start_pos,
+        )
+        self.env.initialize_dynamic_obstacles(
+            auv_max_speed=self.max_speed,
+            rng=self.rng,
         )
 
         # State.
@@ -66,6 +70,7 @@ class AUVTargetSim(ShowBase):
         self.trail_update_interval = 0.10
         self._trail_timer = 0.0
         self.trail_np = self.render.attachNewNode("auv-trail")
+        self.obstacle_nodes: list = []
 
         self._configure_window()
         self.disableMouse()
@@ -210,6 +215,7 @@ class AUVTargetSim(ShowBase):
             self.obstacle_root_np.removeNode()
 
         self.obstacle_root_np = self.render.attachNewNode("obstacles")
+        self.obstacle_nodes = []
         if not self.env.obstacles:
             return
 
@@ -223,8 +229,17 @@ class AUVTargetSim(ShowBase):
             sphere.setPos(*obstacle.center.tolist())
             sphere.setColor(0.90, 0.42, 0.18, 0.42)
             sphere.setTransparency(TransparencyAttrib.MAlpha)
+            self.obstacle_nodes.append(sphere)
 
         template.removeNode()
+
+    def _sync_obstacle_visuals(self) -> None:
+        if len(self.obstacle_nodes) != len(self.env.obstacles):
+            self._rebuild_obstacle_visuals()
+            return
+
+        for node, obstacle in zip(self.obstacle_nodes, self.env.obstacles):
+            node.setPos(*obstacle.center.tolist())
 
     # ---------------------------------------------------------------------
     # Environment geometry helpers
@@ -312,6 +327,7 @@ class AUVTargetSim(ShowBase):
         dt = min(globalClock.getDt(), 0.05)
 
         if not self.paused and not self.arrived:
+            self._update_obstacles(dt)
             self._update_guidance(dt)
             self._append_trail_point()
 
@@ -319,6 +335,18 @@ class AUVTargetSim(ShowBase):
         self._update_camera(dt)
         self._update_hud()
         return task.cont
+
+    def _update_obstacles(self, dt: float) -> None:
+        target = self.target_np.getPos(self.render)
+        target_np = np.array([target.getX(), target.getY(), target.getZ()], dtype=float)
+        self.env.update_dynamic_obstacles(
+            dt=dt,
+            auv_max_speed=self.max_speed,
+            target_center=target_np,
+            target_radius=self.target_radius,
+            rng=self.rng,
+        )
+        self._sync_obstacle_visuals()
 
     def _update_guidance(self, dt: float) -> None:
         pos = self.auv_np.getPos(self.render)
@@ -433,6 +461,7 @@ class AUVTargetSim(ShowBase):
         target = self.target_np.getPos(self.render)
         distance = (target - pos).length()
         speed = self.velocity.length()
+        obstacle_speed = self.env.dynamic_obstacle_speed(self.max_speed)
         status = "ARRIVED" if self.arrived else ("PAUSED" if self.paused else "RUNNING")
 
         target_complexity_pct = 100.0 * self.env.requested_obstacle_complexity
@@ -447,7 +476,11 @@ class AUVTargetSim(ShowBase):
                     f"Target  : ({target.getX():6.2f}, {target.getY():6.2f}, {target.getZ():5.2f})",
                     f"Distance: {distance:5.2f} m",
                     f"Speed   : {speed:5.2f} m/s",
-                    f"Obsts   : {len(self.env.obstacles):2d}/{self.env.requested_obstacle_count:2d}  (r={self.env.obstacle_radius:4.2f} m)",
+                    f"ObsVel  : {obstacle_speed:5.2f} m/s",
+                    (
+                        f"Obsts   : {len(self.env.obstacles):2d}/{self.env.requested_obstacle_count:2d}  "
+                        f"(r={self.env.obstacle_radius:4.2f} m)"
+                    ),
                     f"ObsComp : {actual_complexity_pct:5.2f}% / {target_complexity_pct:5.2f}%  [{mode_suffix}]",
                 ]
             )
@@ -523,6 +556,14 @@ class AUVTargetSim(ShowBase):
 
         candidate = Vec3(float(point[0]), float(point[1]), float(point[2]))
         self.target_np.setPos(self.render, candidate)
+        self.env.update_dynamic_obstacles(
+            dt=0.0,
+            auv_max_speed=self.max_speed,
+            target_center=point,
+            target_radius=self.target_radius,
+            rng=self.rng,
+        )
+        self._sync_obstacle_visuals()
         self.arrived = False
 
     def _toggle_pause(self) -> None:

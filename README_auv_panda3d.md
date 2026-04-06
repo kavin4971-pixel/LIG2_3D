@@ -1,16 +1,19 @@
 # Panda3D AUV Target Simulation
 
-이 예제는 `environment3d.py`에 **환경 관련 설정을 집중**시키고,
-`auv_target_sim_panda3d.py`에는 **AUV 동작과 Panda3D 런타임 로직만** 남기도록 정리한 버전입니다.
+이 예제는 `environment3d.py`에 **환경 관련 설정**을 모으고,
+`auv_target_sim_panda3d.py`에는 **AUV 동작과 Panda3D 런타임 로직**만 남기도록 정리한 버전입니다.
 
 ## 파일 구성
 
 - `environment3d.py`
   - 3D 환경 경계
-  - 구형 장애물
+  - 구형 장애물 생성
   - 장애물 복잡도 계산
   - 시작 위치 / 타깃 샘플링 규칙
-  - 환경 기본 설정(`make_default_environment_config()`)
+  - **동적 장애물 이동 설정**
+    - 랜덤 초기 방향
+    - 속도 = `AUV 최대 속도 × 비율`
+    - 벽 / 다른 장애물 / Target 주변 보호영역 충돌 시 랜덤 bounce
 - `auv_target_sim_panda3d.py`
   - Panda3D 기반 AUV 시뮬레이션 메인 스크립트
   - AUV 속도, 가속도, capture radius 등 AUV 관련 파라미터
@@ -37,107 +40,77 @@ python auv_target_sim_panda3d.py
 - `C` : 카메라 리셋
 - `ESC` : 종료
 
-## 이번 리팩터링의 핵심
+## 현재 동작
 
-이전에는 아래 값들이 `auv_target_sim_panda3d.py`에 직접 들어 있었습니다.
-
-- 환경 크기
-- 환경 원점
-- 장애물 반지름
-- 장애물 개수 / 복잡도
-- 장애물 생성 여유 거리
-- 시작 위치 생성 규칙
-- 타깃 샘플링 규칙
-- 환경 바닥 grid 간격
-
-이제 이 값들은 모두 `environment3d.py`의
-`make_default_environment_config()` 안에서 관리합니다.
-
-즉, **환경을 바꾸고 싶으면 environment3d.py만 수정하면 됩니다.**
-
-## 환경 설정을 바꾸는 위치
-
-`environment3d.py`의 아래 함수만 보면 됩니다.
+- AUV는 target을 향해 이동합니다.
+- 장애물은 각자 랜덤한 초기 방향으로 계속 이동합니다.
+- 장애물 속도는 아래처럼 결정됩니다.
 
 ```python
-def make_default_environment_config() -> EnvironmentConfig:
-    return EnvironmentConfig(
-        size=(30.0, 30.0, 12.0),
-        origin=(-15.0, -15.0, 0.0),
-        obstacle_field=ObstacleFieldConfig(
-            radius=1.35,
-            count=None,
-            complexity=0.015,
-            clearance_from_auv_multiplier=2.0,
-            clearance_margin=0.05,
-            max_attempts_per_obstacle=1200,
+obstacle_speed = obstacle_motion.speed_ratio_to_auv_max * auv_max_speed
+```
+
+기본값은 `0.10` 이므로,
+AUV 최대 속도가 `6.0 m/s`이면 장애물은 `0.6 m/s`로 움직입니다.
+
+## 장애물 bounce 조건
+
+장애물은 다음 경우에 현재 진행 방향을 버리고,
+**충돌 면의 바깥쪽 반구 안에서 랜덤한 새 방향**을 선택합니다.
+
+- 환경 벽에 닿을 때
+- 다른 장애물과 겹칠 때
+- Target 주변 보호영역에 닿을 때
+
+Target 보호영역 반경은 기본적으로 아래와 같습니다.
+
+```python
+target_keepout_radius = target_radius + 1.0
+```
+
+즉, 장애물 중심은 항상
+`obstacle_radius + target_keepout_radius` 이상 떨어지도록 밀려납니다.
+
+## 환경 설정 위치
+
+환경을 바꾸고 싶다면 `environment3d.py`의
+`DEFAULT_ENVIRONMENT_CONFIG`만 수정하면 됩니다.
+
+예시:
+
+```python
+DEFAULT_ENVIRONMENT_CONFIG = EnvironmentConfig(
+    size=(30.0, 30.0, 12.0),
+    origin=(-15.0, -15.0, 0.0),
+    random_seed=7,
+    obstacle=ObstacleConfig(
+        radius=1.35,
+        count=None,
+        complexity=0.015,
+        clearance_multiplier=2.0,
+        clearance_padding=0.05,
+        max_attempts_per_obstacle=1200,
+        motion=ObstacleMotionConfig(
+            enabled=True,
+            speed_ratio_to_auv_max=0.10,
+            target_clearance=1.0,
+            resolution_passes=2,
         ),
-        start=StartPointConfig(
-            x_margin=2.0,
-            y_margin=2.0,
-            z_fraction=0.5,
-            reserved_clearance=1.75,
-        ),
-        target=TargetPointConfig(
-            boundary_clearance_base=0.35,
-            boundary_clearance_min=0.80,
-            obstacle_clearance_base=0.15,
-            min_distance_from_current=6.0,
-            max_attempts=2000,
-            fallback_min_z=0.80,
-            fallback_extra_push=0.05,
-        ),
-        visuals=EnvironmentVisualConfig(
-            wire_box_thickness=2.0,
-            floor_grid_spacing=2.0,
-        ),
-    )
-```
-
-## 장애물 복잡도 정의
-
-장애물 복잡도는 아래처럼 정의합니다.
-
-```python
-obstacle_complexity = total_obstacle_volume / environment_volume
-```
-
-구형 장애물 반지름이 `r`일 때,
-구 하나의 부피는 다음과 같습니다.
-
-```python
-sphere_volume = (4.0 / 3.0) * math.pi * (r ** 3)
-```
-
-복잡도로부터 장애물 개수는 대략 아래처럼 결정됩니다.
-
-```python
-count ≈ round((obstacle_complexity * environment_volume) / sphere_volume)
-```
-
-실제 배치에서는 장애물끼리 겹치지 않아야 하고,
-시작 위치와도 충분한 간격을 둬야 하므로,
-**실제 배치 수는 요청 수보다 적을 수 있습니다.**
-
-## 장애물 설정 예시
-
-### 1) 수동 개수 모드
-
-```python
-obstacle_field=ObstacleFieldConfig(
-    radius=1.20,
-    count=12,
-    complexity=None,
-)
-```
-
-### 2) 복잡도 기반 자동 모드
-
-```python
-obstacle_field=ObstacleFieldConfig(
-    radius=1.35,
-    count=None,
-    complexity=0.015,
+    ),
+    spawn=SpawnConfig(
+        start_offset_xy=(2.0, 2.0),
+        start_height_ratio=0.5,
+        start_reserved_extra=1.75,
+        target_boundary_padding=0.35,
+        min_target_boundary_clearance=0.80,
+        target_obstacle_padding=0.15,
+        target_min_distance_from_agent=6.0,
+        target_max_attempts=2000,
+    ),
+    visual=EnvironmentVisualConfig(
+        box_line_thickness=2.0,
+        grid_spacing=2.0,
+    ),
 )
 ```
 
@@ -156,8 +129,8 @@ self.target_radius = 0.42
 
 즉,
 
-- 환경을 바꾸는 일 → `environment3d.py`
-- AUV 성능/운동을 바꾸는 일 → `auv_target_sim_panda3d.py`
+- 환경 / 장애물 / obstacle motion 변경 → `environment3d.py`
+- AUV 성능 / guidance 변경 → `auv_target_sim_panda3d.py`
 
 로 역할이 분리됩니다.
 
