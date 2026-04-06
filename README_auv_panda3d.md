@@ -1,11 +1,12 @@
 # Panda3D AUV Target Simulation
 
-이 예제는 업로드한 `environment3d.py`의 `Environment3D` 클래스를 그대로 사용해서
-3차원 경계 박스 내부에서 AUV가 Target으로 이동하는 시뮬레이션을 보여줍니다.
+이 예제는 업로드한 `environment3d.py`의 `Environment3D`를 확장해서,
+3차원 경계 박스 내부에서 AUV가 Target으로 이동하고,
+환경 안에 **구형(sphere) 장애물**이 존재하는 시뮬레이션을 보여줍니다.
 
 ## 파일 구성
 
-- `environment3d.py` : 사용자가 업로드한 3D 환경 경계 클래스
+- `environment3d.py` : 3D 환경 경계 + 구형 장애물 + 복잡도 계산
 - `auv_target_sim_panda3d.py` : Panda3D 기반 AUV 시뮬레이션 메인 스크립트
 
 ## 설치
@@ -29,17 +30,71 @@ python auv_target_sim_panda3d.py
 - `C` : 카메라 리셋
 - `ESC` : 종료
 
-## 핵심 아이디어
+## 이번 단계에서 추가된 내용
 
-- `Environment3D`의 `min_bound`, `max_bound`를 Panda3D 씬 경계로 사용
-- AUV는 현재 위치에서 타깃까지의 방향 벡터를 따라 가속
-- `max_speed`, `max_accel`, `slowdown_radius`로 움직임 튜닝
-- `clamp()`를 사용해 경계 밖으로 나가지 않게 제한
-- Panda3D task 루프에서 매 프레임 상태 업데이트
+- 환경 내부에 **구형 장애물** 랜덤 생성
+- 장애물 파라미터:
+  - `obstacle_radius`
+  - `obstacle_count`
+  - `obstacle_complexity`
+- AUV 시작 위치와 타깃 위치가 장애물과 겹치지 않도록 샘플링
+- AUV가 장애물 내부로 들어가면 표면 바깥으로 밀어내는 간단한 충돌 처리
+- HUD에 장애물 개수 / 실제 복잡도 표시
 
-## 크기 변경
+## 장애물 복잡도 정의
 
-현재 예제는 아래처럼 환경을 설정합니다.
+장애물 복잡도는 아래처럼 정의했습니다.
+
+```python
+obstacle_complexity = total_obstacle_volume / environment_volume
+```
+
+구형 장애물 반지름이 `r`일 때,
+구 하나의 부피는 다음과 같습니다.
+
+```python
+sphere_volume = (4.0 / 3.0) * math.pi * (r ** 3)
+```
+
+따라서 복잡도로부터 장애물 개수는 대략 아래처럼 결정됩니다.
+
+```python
+count ≈ round((obstacle_complexity * environment_volume) / sphere_volume)
+```
+
+실제 배치에서는 장애물끼리 겹치지 않아야 하고,
+벽/시작 위치와도 여유 간격을 둬야 하므로,
+**요청한 개수보다 실제 배치 개수가 더 적을 수 있습니다.**
+HUD에는 `실제 배치 수 / 요청 수`가 함께 표시됩니다.
+
+## 장애물 설정 방법
+
+`auv_target_sim_panda3d.py` 안에서 아래 블록을 조절하면 됩니다.
+
+```python
+self.obstacle_radius = 1.35
+self.obstacle_count: int | None = None       # 정수로 넣으면 수동 개수 모드
+self.obstacle_complexity: float | None = 0.015
+self.obstacle_clearance = 2.0 * self.auv_radius + 0.05
+```
+
+### 1) 수동 개수 모드
+
+```python
+self.obstacle_radius = 1.20
+self.obstacle_count = 12
+self.obstacle_complexity = None
+```
+
+### 2) 복잡도 기반 자동 모드
+
+```python
+self.obstacle_radius = 1.35
+self.obstacle_count = None
+self.obstacle_complexity = 0.015
+```
+
+## 현재 예제의 환경 크기
 
 ```python
 self.env = Environment3D.from_size(
@@ -58,7 +113,7 @@ self.env = Environment3D()
 
 ## 다음 단계 추천
 
-1. 장애물(sphere / box) 추가
+1. 장애물 회피 벡터(avoidance force) 추가
 2. 단순 seek 대신 PID 또는 LOS guidance 적용
 3. 수중 드래그/부력/유체저항 모델 추가
 4. 센서(sonar/FOV)와 waypoint 기반 경로 계획 추가

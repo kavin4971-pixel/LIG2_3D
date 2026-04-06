@@ -18,7 +18,7 @@ from panda3d.core import (
     WindowProperties,
 )
 
-from environment3d import Environment3D
+from environment3d import Environment3D, SphereObstacle
 
 
 class AUVTargetSim(ShowBase):
@@ -28,6 +28,14 @@ class AUVTargetSim(ShowBase):
     - X: left/right
     - Y: forward/backward (Panda3D forward axis)
     - Z: up/down
+
+    Obstacle modes:
+    - Manual count mode: set ``self.obstacle_count`` to an integer.
+    - Complexity mode  : set ``self.obstacle_count = None`` and choose
+      ``self.obstacle_complexity`` in [0, 1].
+
+    Complexity definition:
+        obstacle_complexity = total_obstacle_volume / environment_volume
     """
 
     def __init__(self) -> None:
@@ -39,6 +47,7 @@ class AUVTargetSim(ShowBase):
             size=(30.0, 30.0, 12.0),
             origin=(-15.0, -15.0, 0.0),
         )
+        self.rng = np.random.default_rng(7)
 
         # Guidance / motion tuning parameters.
         self.capture_radius = 0.50
@@ -48,6 +57,20 @@ class AUVTargetSim(ShowBase):
         self.paused = False
         self.arrived = False
 
+        # Simple collision proxy sizes.
+        self.auv_radius = 0.65
+        self.target_radius = 0.42
+
+        # Obstacle tuning.
+        self.obstacle_radius = 1.35
+        self.obstacle_count: int | None = None       # Set an int to override auto mode.
+        self.obstacle_complexity: float | None = 0.015
+        self.obstacle_clearance = 2.0 * self.auv_radius + 0.05
+        self.max_obstacle_attempts_per_obstacle = 1200
+        self.requested_obstacle_count = 0
+        self.requested_obstacle_complexity = 0.0
+        self.obstacle_mode = "complexity"
+
         # State.
         self.velocity = Vec3(0, 0, 0)
         self.trail_points: list[tuple[float, float, float]] = []
@@ -55,6 +78,16 @@ class AUVTargetSim(ShowBase):
         self.trail_update_interval = 0.10
         self._trail_timer = 0.0
         self.trail_np = self.render.attachNewNode("auv-trail")
+
+        self.start_pos = np.array(
+            [
+                self.env.min_bound[0] + 2.0,
+                self.env.min_bound[1] + 2.0,
+                self.env.min_bound[2] + self.env.size[2] * 0.5,
+            ],
+            dtype=float,
+        )
+        self._generate_obstacles()
 
         self._configure_window()
         self.disableMouse()
@@ -69,15 +102,7 @@ class AUVTargetSim(ShowBase):
         self._build_ui()
         self._bind_keys()
 
-        start_pos = np.array(
-            [
-                self.env.min_bound[0] + 2.0,
-                self.env.min_bound[1] + 2.0,
-                self.env.min_bound[2] + self.env.size[2] * 0.5,
-            ],
-            dtype=float,
-        )
-        self.auv_np.setPos(*start_pos.tolist())
+        self.auv_np.setPos(*self.start_pos.tolist())
         self._append_trail_point(force=True)
         self.randomize_target()
         self._reset_camera()
@@ -133,6 +158,8 @@ class AUVTargetSim(ShowBase):
         )
         surface.reparentTo(self.render)
 
+        self._rebuild_obstacle_visuals()
+
     def _build_auv(self) -> None:
         self.auv_np = self.render.attachNewNode("auv")
 
@@ -168,7 +195,7 @@ class AUVTargetSim(ShowBase):
     def _build_target(self) -> None:
         self.target_np = self.loader.loadModel("models/misc/sphere")
         self.target_np.reparentTo(self.render)
-        self.target_np.setScale(0.42)
+        self.target_np.setScale(self.target_radius)
         self.target_np.setColor(1.00, 0.15, 0.15, 1.0)
 
         self.target_ring_np = self.render.attachNewNode("target-ring")
@@ -195,6 +222,62 @@ class AUVTargetSim(ShowBase):
         self.accept("r", self.randomize_target)
         self.accept("c", self._reset_camera)
         self.accept("escape", self.userExit)
+
+    # ---------------------------------------------------------------------
+    # Obstacle setup
+    # ---------------------------------------------------------------------
+    def _generate_obstacles(self) -> None:
+        if self.obstacle_count is not None:
+            self.obstacle_mode = "count"
+            self.requested_obstacle_count = max(0, int(self.obstacle_count))
+            self.requested_obstacle_complexity = self.env.complexity_from_count(
+                radius=self.obstacle_radius,
+                count=self.requested_obstacle_count,
+            )
+        else:
+            self.obstacle_mode = "complexity"
+            requested_complexity = 0.0 if self.obstacle_complexity is None else float(self.obstacle_complexity)
+            if not 0.0 <= requested_complexity <= 1.0:
+                raise ValueError("obstacle_complexity must be between 0 and 1.")
+            self.requested_obstacle_complexity = requested_complexity
+            self.requested_obstacle_count = self.env.obstacle_count_from_complexity(
+                radius=self.obstacle_radius,
+                complexity=requested_complexity,
+            )
+
+        reserved_spheres = [
+            (self.start_pos, self.auv_radius + 1.75),
+        ]
+
+        self.env.generate_random_sphere_obstacles(
+            radius=self.obstacle_radius,
+            count=self.requested_obstacle_count,
+            rng=self.rng,
+            clearance=self.obstacle_clearance,
+            reserved_spheres=reserved_spheres,
+            max_attempts_per_obstacle=self.max_obstacle_attempts_per_obstacle,
+        )
+
+    def _rebuild_obstacle_visuals(self) -> None:
+        if hasattr(self, "obstacle_root_np"):
+            self.obstacle_root_np.removeNode()
+
+        self.obstacle_root_np = self.render.attachNewNode("obstacles")
+        if not self.env.obstacles:
+            return
+
+        template = self.loader.loadModel("models/misc/sphere")
+        template.setTransparency(TransparencyAttrib.MAlpha)
+
+        for idx, obstacle in enumerate(self.env.obstacles):
+            sphere = template.copyTo(self.obstacle_root_np)
+            sphere.setName(f"obstacle-{idx}")
+            sphere.setScale(obstacle.radius)
+            sphere.setPos(*obstacle.center.tolist())
+            sphere.setColor(0.90, 0.42, 0.18, 0.42)
+            sphere.setTransparency(TransparencyAttrib.MAlpha)
+
+        template.removeNode()
 
     # ---------------------------------------------------------------------
     # Environment geometry helpers
@@ -327,18 +410,57 @@ class AUVTargetSim(ShowBase):
             self.auv_np.lookAt(self.auv_np.getPos(self.render) + self.velocity)
 
     def _clamp_and_resolve(self, pos: Vec3) -> Vec3:
-        raw = np.array([pos.getX(), pos.getY(), pos.getZ()], dtype=float)
-        clamped = self.env.clamp(raw)
+        point = np.array([pos.getX(), pos.getY(), pos.getZ()], dtype=float)
+        velocity = np.array(
+            [self.velocity.getX(), self.velocity.getY(), self.velocity.getZ()],
+            dtype=float,
+        )
 
-        if not np.allclose(raw, clamped):
-            if raw[0] != clamped[0]:
-                self.velocity.setX(-0.2 * self.velocity.getX())
-            if raw[1] != clamped[1]:
-                self.velocity.setY(-0.2 * self.velocity.getY())
-            if raw[2] != clamped[2]:
-                self.velocity.setZ(-0.2 * self.velocity.getZ())
+        clamped = self.env.clamp(point)
+        if not np.allclose(point, clamped):
+            if point[0] != clamped[0]:
+                velocity[0] *= -0.2
+            if point[1] != clamped[1]:
+                velocity[1] *= -0.2
+            if point[2] != clamped[2]:
+                velocity[2] *= -0.2
+            point = clamped
 
-        return Vec3(float(clamped[0]), float(clamped[1]), float(clamped[2]))
+        for _ in range(3):
+            adjusted = False
+            point = self.env.clamp(point)
+
+            for obstacle in self.env.obstacles:
+                delta = point - obstacle.center
+                min_distance = obstacle.radius + self.auv_radius
+                distance = float(np.linalg.norm(delta))
+
+                if distance >= min_distance:
+                    continue
+
+                adjusted = True
+                if distance < 1e-8:
+                    speed_norm = float(np.linalg.norm(velocity))
+                    if speed_norm > 1e-8:
+                        normal = velocity / speed_norm
+                    else:
+                        normal = np.array([1.0, 0.0, 0.0], dtype=float)
+                else:
+                    normal = delta / distance
+
+                point = obstacle.center + normal * min_distance
+
+                inward_speed = float(np.dot(velocity, normal))
+                if inward_speed < 0.0:
+                    velocity = velocity - inward_speed * normal
+                    velocity *= 0.75
+
+            if not adjusted:
+                break
+
+        point = self.env.clamp(point)
+        self.velocity = Vec3(float(velocity[0]), float(velocity[1]), float(velocity[2]))
+        return Vec3(float(point[0]), float(point[1]), float(point[2]))
 
     # ---------------------------------------------------------------------
     # Camera / UI / target visuals
@@ -366,6 +488,10 @@ class AUVTargetSim(ShowBase):
         speed = self.velocity.length()
         status = "ARRIVED" if self.arrived else ("PAUSED" if self.paused else "RUNNING")
 
+        target_complexity_pct = 100.0 * self.requested_obstacle_complexity
+        actual_complexity_pct = 100.0 * self.env.obstacle_complexity
+        mode_suffix = "manual count" if self.obstacle_mode == "count" else "auto complexity"
+
         self.hud_text.setText(
             "\n".join(
                 [
@@ -374,6 +500,8 @@ class AUVTargetSim(ShowBase):
                     f"Target  : ({target.getX():6.2f}, {target.getY():6.2f}, {target.getZ():5.2f})",
                     f"Distance: {distance:5.2f} m",
                     f"Speed   : {speed:5.2f} m/s",
+                    f"Obsts   : {len(self.env.obstacles):2d}/{self.requested_obstacle_count:2d}  (r={self.obstacle_radius:4.2f} m)",
+                    f"ObsComp : {actual_complexity_pct:5.2f}% / {target_complexity_pct:5.2f}%  [{mode_suffix}]",
                 ]
             )
         )
@@ -439,22 +567,35 @@ class AUVTargetSim(ShowBase):
 
     def randomize_target(self) -> None:
         current = self.auv_np.getPos(self.render)
+        current_np = np.array([current.getX(), current.getY(), current.getZ()], dtype=float)
 
-        for _ in range(100):
-            p = self.env.random_point()
-            p[2] = max(float(self.env.min_bound[2]) + 0.8, float(p[2]))
-            candidate = Vec3(float(p[0]), float(p[1]), float(p[2]))
-            if (candidate - current).length() >= 6.0:
-                self.target_np.setPos(self.render, candidate)
-                self.arrived = False
-                return
+        try:
+            point = self.env.random_free_point(
+                rng=self.rng,
+                boundary_clearance=max(self.target_radius + 0.35, 0.80),
+                obstacle_clearance=self.target_radius + 0.15,
+                reserved_spheres=[(current_np, 6.0)],
+                max_attempts=2000,
+            )
+        except RuntimeError:
+            point = self.env.center.copy()
+            point[2] = max(point[2], self.env.min_bound[2] + 0.80)
+            point = self.env.clamp(point)
 
-        fallback = Vec3(
-            float(self.env.center[0]),
-            float(self.env.center[1]),
-            float(self.env.center[2]),
-        )
-        self.target_np.setPos(self.render, fallback)
+            if not self.env.is_point_obstacle_free(point, clearance=self.target_radius + 0.15):
+                for obstacle in self.env.obstacles:
+                    delta = point - obstacle.center
+                    distance = float(np.linalg.norm(delta))
+                    min_distance = obstacle.radius + self.target_radius + 0.20
+                    if distance < min_distance:
+                        if distance < 1e-8:
+                            delta = np.array([1.0, 0.0, 0.0], dtype=float)
+                            distance = 1.0
+                        point = obstacle.center + (delta / distance) * min_distance
+                point = self.env.clamp(point)
+
+        candidate = Vec3(float(point[0]), float(point[1]), float(point[2]))
+        self.target_np.setPos(self.render, candidate)
         self.arrived = False
 
     def _toggle_pause(self) -> None:
