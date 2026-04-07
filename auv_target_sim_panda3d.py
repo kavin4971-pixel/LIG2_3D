@@ -41,12 +41,24 @@ def _deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
 
 
 def layout_config_from_dict(data: dict[str, Any] | None) -> LayoutConfig:
-    merged = asdict(LayoutConfig())
+    defaults = LayoutConfig()
+    merged = asdict(defaults)
     if data:
         _deep_update(merged, data)
+
+    latitude_range_raw = merged.get("latitude_deg_range", defaults.latitude_deg_range)
+    latitude_deg_range = None
+    if latitude_range_raw is not None:
+        latitude_deg_range = tuple(float(v) for v in latitude_range_raw)
+
     return LayoutConfig(
         size=tuple(float(v) for v in merged["size"]),
         origin=tuple(float(v) for v in merged["origin"]),
+        latitude_deg=float(merged.get("latitude_deg", defaults.latitude_deg)),
+        latitude_deg_range=latitude_deg_range,
+        coriolis_enabled=bool(merged.get("coriolis_enabled", defaults.coriolis_enabled)),
+        traditional_coriolis=bool(merged.get("traditional_coriolis", defaults.traditional_coriolis)),
+        coriolis_scale=float(merged.get("coriolis_scale", defaults.coriolis_scale)),
         obstacle_field=ObstacleFieldConfig(**merged["obstacle_field"]),
         spawn=SpawnConfig(**merged["spawn"]),
         seed=int(merged["seed"]),
@@ -110,8 +122,8 @@ class AUVTargetSim(ShowBase):
 
     The key design choice is to reuse ``AUVNavigationRLEnv`` from the training
     script directly. That keeps the Panda3D demo and the RL environment aligned:
-    same observation vector, same obstacle motion rules, and same hard-failure
-    collision logic.
+    same observation vector, same obstacle motion rules, same hard-failure
+    collision logic, and the same environment-owned physics such as Coriolis drift.
     """
 
     def __init__(
@@ -139,6 +151,7 @@ class AUVTargetSim(ShowBase):
             layout_config=self.layout_config,
             sim_config=self.sim_config,
         )
+        self._validate_policy_compatibility()
 
         # Runtime state.
         self.current_obs = np.zeros(self.rl_env.observation_space.shape, dtype=np.float32)
@@ -184,6 +197,20 @@ class AUVTargetSim(ShowBase):
     # ------------------------------------------------------------------
     # Scene setup
     # ------------------------------------------------------------------
+    def _validate_policy_compatibility(self) -> None:
+        model_obs = getattr(self.model, "observation_space", None)
+        env_obs = getattr(self.rl_env, "observation_space", None)
+        model_shape = tuple(int(v) for v in getattr(model_obs, "shape", ()) or ())
+        env_shape = tuple(int(v) for v in getattr(env_obs, "shape", ()) or ())
+        if model_shape and env_shape and model_shape != env_shape:
+            raise RuntimeError(
+                "Loaded PPO policy expects observation shape "
+                f"{model_shape}, but the current environment emits {env_shape}. "
+                "The observation vector now includes explicit Coriolis context "
+                "(latitude/f/enabled), so older checkpoints must be retrained "
+                "with the updated auv_rl_collision_train.py."
+            )
+
     @property
     def min_bound(self) -> np.ndarray:
         return np.asarray(self.layout_config.origin, dtype=float)
@@ -581,6 +608,7 @@ class AUVTargetSim(ShowBase):
 
         self.target_ring_np.attachNewNode(segs.create())
 
+
     def _update_hud(self) -> None:
         agent = self.rl_env.agent_pos
         target = self.rl_env.target_pos
@@ -592,6 +620,15 @@ class AUVTargetSim(ShowBase):
         requested_complexity = 100.0 * float(self.rl_env.requested_obstacle_complexity)
         actual_complexity = 100.0 * self.actual_obstacle_complexity
         min_clearance_text = "inf" if math.isinf(min_clearance) else f"{min_clearance:5.2f} m"
+        latitude_deg = float(self.last_info.get("latitude_deg", self.layout_config.latitude_deg))
+        coriolis_enabled = bool(self.last_info.get("coriolis_enabled", self.layout_config.coriolis_enabled))
+        coriolis_f = float(self.last_info.get("coriolis_parameter", 0.0))
+        coriolis_norm = float(
+            self.last_info.get(
+                "coriolis_accel_norm",
+                np.linalg.norm(self.rl_env.last_coriolis_accel),
+            )
+        )
         reset_text = (
             "-"
             if (not self.episode_done or self.auto_reset_delay < 0.0)
@@ -609,6 +646,7 @@ class AUVTargetSim(ShowBase):
                     f"Target    : ({target[0]:6.2f}, {target[1]:6.2f}, {target[2]:5.2f})",
                     f"Distance  : {distance:5.2f} m   Speed = {speed:5.2f} m/s   MinClr = {min_clearance_text}",
                     f"Action    : ({self.last_action[0]:+5.2f}, {self.last_action[1]:+5.2f}, {self.last_action[2]:+5.2f})   Reward = {self.last_reward:+7.3f}",
+                    f"Coriolis  : {'ON ' if coriolis_enabled else 'OFF'}  Lat = {latitude_deg:+6.2f} deg   f = {coriolis_f:+.6e} 1/s   |a_c| = {coriolis_norm:7.5f} m/s^2",
                     f"Obstacles : {len(self.rl_env.obstacles):2d}/{self.rl_env.requested_obstacle_count:2d}   ObsVel = {self.sim_config.obstacle_speed:4.2f} m/s",
                     f"ObsComp   : {actual_complexity:5.2f}% / {requested_complexity:5.2f}%",
                 ]
@@ -708,6 +746,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Base seed for episode resets. Defaults to the training sim_config seed.",
     )
+    parser.add_argument(
+        "--latitude-deg",
+        type=float,
+        default=None,
+        help="Optional fixed latitude override for the Coriolis environment used by the viewer.",
+    )
+    parser.add_argument(
+        "--latitude-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LAT_MIN", "LAT_MAX"),
+        help="Optional per-episode latitude sampling range override for the viewer.",
+    )
+    parser.add_argument(
+        "--disable-coriolis",
+        action="store_true",
+        help="Disable Coriolis in the viewer, even if it was enabled during training.",
+    )
+    parser.add_argument(
+        "--coriolis-scale",
+        type=float,
+        default=None,
+        help="Optional scale override for the Coriolis term used by the viewer.",
+    )
     return parser.parse_args()
 
 
@@ -720,6 +783,18 @@ def main() -> None:
         )
 
     layout_cfg, sim_cfg, used_config = load_training_configs(model_path, args.config_path)
+    if args.latitude_deg is not None:
+        layout_cfg.latitude_deg = float(args.latitude_deg)
+        layout_cfg.latitude_deg_range = None
+        layout_cfg.coriolis_enabled = True
+    if args.latitude_range is not None:
+        layout_cfg.latitude_deg_range = tuple(float(v) for v in args.latitude_range)
+        layout_cfg.coriolis_enabled = True
+    if args.disable_coriolis:
+        layout_cfg.coriolis_enabled = False
+    if args.coriolis_scale is not None:
+        layout_cfg.coriolis_scale = float(args.coriolis_scale)
+
     app = AUVTargetSim(
         model_path=model_path,
         layout_config=layout_cfg,

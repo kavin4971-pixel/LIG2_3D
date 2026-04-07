@@ -3,8 +3,8 @@ from __future__ import annotations
 """RL training script for AUV target reaching with hard collision failures.
 
 This file is intentionally self-contained:
-- it reuses ``Environment3D`` from ``environment3d.py`` only for the 3D box
-  bounds and random point sampling,
+- it reuses ``Environment3D`` from ``environment3d.py`` for the 3D box bounds,
+  random point sampling, and environment-owned physics such as Coriolis drift,
 - it implements its own spherical obstacle field,
 - it treats wall/obstacle contact as immediate failure,
 - it provides PPO training and evaluation helpers.
@@ -31,7 +31,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from environment3d import Environment3D
+from environment3d import EARTH_ROTATION_RATE_RAD_PER_SEC, Environment3D
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +89,7 @@ else:  # pragma: no cover - path used when gymnasium is installed.
 
 
 Vector3 = np.ndarray
+OBSERVATION_VERSION = 2
 
 
 @dataclass
@@ -116,9 +117,34 @@ class SpawnConfig:
 class LayoutConfig:
     size: tuple[float, float, float] = (30.0, 30.0, 12.0)
     origin: tuple[float, float, float] = (-15.0, -15.0, 0.0)
+    latitude_deg: float = 36.0
+    latitude_deg_range: tuple[float, float] | None = None
+    coriolis_enabled: bool = True
+    traditional_coriolis: bool = True
+    coriolis_scale: float = 1.0
     obstacle_field: ObstacleFieldConfig = field(default_factory=ObstacleFieldConfig)
     spawn: SpawnConfig = field(default_factory=SpawnConfig)
     seed: int = 7
+
+    def __post_init__(self) -> None:
+        self.latitude_deg = float(self.latitude_deg)
+        if not -90.0 <= self.latitude_deg <= 90.0:
+            raise ValueError("latitude_deg must be between -90 and 90.")
+
+        if self.latitude_deg_range is not None:
+            if len(self.latitude_deg_range) != 2:
+                raise ValueError("latitude_deg_range must contain exactly two values.")
+            low = float(self.latitude_deg_range[0])
+            high = float(self.latitude_deg_range[1])
+            if low > high:
+                raise ValueError("latitude_deg_range must satisfy low <= high.")
+            if low < -90.0 or high > 90.0:
+                raise ValueError("latitude_deg_range values must be between -90 and 90.")
+            self.latitude_deg_range = (low, high)
+
+        self.coriolis_enabled = bool(self.coriolis_enabled)
+        self.traditional_coriolis = bool(self.traditional_coriolis)
+        self.coriolis_scale = float(self.coriolis_scale)
 
 
 @dataclass
@@ -241,6 +267,9 @@ class AUVNavigationRLEnv(GymEnvBase):
         self.last_event = "reset"
         self.requested_obstacle_count = 0
         self.requested_obstacle_complexity = 0.0
+        self.last_environment_accel = np.zeros(3, dtype=float)
+        self.last_coriolis_accel = np.zeros(3, dtype=float)
+        self.current_latitude_deg = float(self.layout_config.latitude_deg)
 
         obs_dim = self._observation_dim()
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
@@ -266,12 +295,19 @@ class AUVNavigationRLEnv(GymEnvBase):
         self._episode_index += 1
         self.rng = np.random.default_rng(episode_seed)
 
+        self.current_latitude_deg = self._sample_episode_latitude_deg()
         self.env = Environment3D.from_size(
             size=self.layout_config.size,
             origin=self.layout_config.origin,
+            latitude_deg=self.current_latitude_deg,
+            coriolis_enabled=self.layout_config.coriolis_enabled,
+            coriolis_scale=self.layout_config.coriolis_scale,
+            traditional_approximation=self.layout_config.traditional_coriolis,
         )
         self.agent_pos = self._default_start_position()
         self.agent_vel = np.zeros(3, dtype=float)
+        self.last_environment_accel = np.zeros(3, dtype=float)
+        self.last_coriolis_accel = np.zeros(3, dtype=float)
         self.last_event = "running"
         self.step_count = 0
 
@@ -305,7 +341,12 @@ class AUVNavigationRLEnv(GymEnvBase):
                 return obs, -cfg.collision_penalty, True, False, info
 
         accel_cmd = action_arr.astype(float) * cfg.max_accel
-        self.agent_vel = self.agent_vel + accel_cmd * cfg.dt
+        env_accel = self._environmental_acceleration(self.agent_pos, self.agent_vel)
+        self.last_environment_accel = env_accel
+        self.last_coriolis_accel = env_accel.copy()
+
+        total_accel = accel_cmd + env_accel
+        self.agent_vel = self.agent_vel + total_accel * cfg.dt
         self.agent_vel = self._clip_norm(self.agent_vel, cfg.max_speed)
 
         proposed_pos = self.agent_pos + self.agent_vel * cfg.dt
@@ -347,6 +388,8 @@ class AUVNavigationRLEnv(GymEnvBase):
         return obs, float(reward), False, truncated, info
 
     def render(self) -> dict[str, Any]:
+        latitude_deg = self.current_latitude_deg
+        coriolis_parameter = 0.0 if self.env is None else float(self.env.coriolis_parameter)
         return {
             "agent_pos": self.agent_pos.copy(),
             "agent_vel": self.agent_vel.copy(),
@@ -355,6 +398,10 @@ class AUVNavigationRLEnv(GymEnvBase):
             "requested_obstacle_count": int(self.requested_obstacle_count),
             "event": self.last_event,
             "step_count": self.step_count,
+            "environment_accel": self.last_environment_accel.copy(),
+            "coriolis_accel": self.last_coriolis_accel.copy(),
+            "latitude_deg": float(latitude_deg),
+            "coriolis_parameter": coriolis_parameter,
         }
 
     def close(self) -> None:
@@ -376,6 +423,14 @@ class AUVNavigationRLEnv(GymEnvBase):
             dtype=float,
         )
         return self.env.clamp(point)
+
+
+    def _sample_episode_latitude_deg(self) -> float:
+        lat_range = self.layout_config.latitude_deg_range
+        if lat_range is None:
+            return float(self.layout_config.latitude_deg)
+        low, high = lat_range
+        return float(self.rng.uniform(low, high))
 
     def _generate_obstacles(self) -> list[SphereObstacle]:
         if self.env is None:
@@ -460,7 +515,7 @@ class AUVNavigationRLEnv(GymEnvBase):
     # ------------------------------------------------------------------
     def _observation_dim(self) -> int:
         k = int(self.sim_config.nearest_obstacles_in_observation)
-        base = 3 + 3 + 3 + 1 + 6 + 1  # pos, vel, target rel, target dist, wall margins, min clearance
+        base = 3 + 3 + 3 + 1 + 6 + 1 + 2  # pos, vel, target rel, target dist, wall margins, min clearance, [lat, f]
         per_obstacle = 3 + 3 + 1 + 1 + 1  # rel pos, rel vel, radius, clearance, active flag
         return base + k * per_obstacle
 
@@ -490,6 +545,11 @@ class AUVNavigationRLEnv(GymEnvBase):
             ],
             dtype=float,
         )
+
+        lat_norm = float(self.current_latitude_deg) / 90.0
+        max_ref_f = max(2.0 * EARTH_ROTATION_RATE_RAD_PER_SEC, 1e-12)
+        f_norm = float(env.coriolis_parameter) / max_ref_f
+        coriolis_context = np.array([lat_norm, f_norm], dtype=float)
 
         clearances: list[tuple[float, np.ndarray]] = []
         for obstacle in self.obstacles:
@@ -526,6 +586,7 @@ class AUVNavigationRLEnv(GymEnvBase):
                 target_dist,
                 wall_margins,
                 min_clearance,
+                coriolis_context,
                 *blocks,
             ]
         )
@@ -556,6 +617,13 @@ class AUVNavigationRLEnv(GymEnvBase):
         collision: bool = False,
         success: bool = False,
     ) -> dict[str, Any]:
+        env = self.env
+        latitude_deg = self.current_latitude_deg
+        if env is not None and env.latitude_deg is not None:
+            latitude_deg = float(env.latitude_deg)
+        coriolis_parameter = 0.0 if env is None else float(env.coriolis_parameter)
+        coriolis_accel_norm = float(np.linalg.norm(self.last_coriolis_accel))
+
         return {
             "is_success": bool(success),
             "collision": bool(collision),
@@ -565,13 +633,27 @@ class AUVNavigationRLEnv(GymEnvBase):
             "step_count": int(self.step_count),
             "requested_obstacle_count": int(self.requested_obstacle_count),
             "actual_obstacle_count": int(len(self.obstacles)),
+            "latitude_deg": float(latitude_deg),
+            "coriolis_enabled": bool(self.layout_config.coriolis_enabled),
+            "coriolis_parameter": coriolis_parameter,
+            "coriolis_accel_norm": coriolis_accel_norm,
         }
 
     # ------------------------------------------------------------------
     # Dynamic obstacle updates
     # ------------------------------------------------------------------
     def _update_dynamic_obstacles(self, dt: float) -> None:
+        if self.env is None:
+            return
+
+        speed = self.sim_config.obstacle_speed
         for obstacle in self.obstacles:
+            obstacle.velocity = self.env.apply_coriolis_to_velocity(obstacle.velocity, dt)
+            obstacle.velocity = self._rescale_norm(
+                obstacle.velocity,
+                speed,
+                fallback=self._random_unit_vector(),
+            )
             obstacle.center = obstacle.center + obstacle.velocity * dt
         self._resolve_dynamic_constraints()
 
@@ -694,6 +776,11 @@ class AUVNavigationRLEnv(GymEnvBase):
     def _agent_hits_any_obstacle(self, position: Vector3) -> bool:
         return any(self._agent_clearance_to_obstacle(position, obstacle) <= 0.0 for obstacle in self.obstacles)
 
+    def _environmental_acceleration(self, position: Vector3, velocity: Vector3) -> Vector3:
+        if self.env is None:
+            raise RuntimeError("Environment not initialized.")
+        return self.env.environmental_acceleration(position=position, velocity=velocity)
+
     def _agent_clearance_to_obstacle(self, position: Vector3, obstacle: SphereObstacle) -> float:
         return float(np.linalg.norm(position - obstacle.center) - (self.sim_config.auv_radius + obstacle.radius))
 
@@ -735,6 +822,28 @@ class AUVNavigationRLEnv(GymEnvBase):
         if norm <= max_norm or norm < 1e-12:
             return vec
         return vec * (max_norm / norm)
+
+    @staticmethod
+    def _rescale_norm(
+        vec: Vector3,
+        target_norm: float,
+        *,
+        fallback: Vector3 | None = None,
+    ) -> Vector3:
+        target_norm = float(target_norm)
+        if target_norm <= 0.0:
+            return np.zeros(3, dtype=float)
+
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-12:
+            base = np.array([1.0, 0.0, 0.0], dtype=float) if fallback is None else np.asarray(fallback, dtype=float).reshape(3)
+            base_norm = float(np.linalg.norm(base))
+            if base_norm < 1e-12:
+                base = np.array([1.0, 0.0, 0.0], dtype=float)
+                base_norm = 1.0
+            return base * (target_norm / base_norm)
+
+        return vec * (target_norm / norm)
 
     @staticmethod
     def _distance(a: Vector3, b: Vector3) -> float:
@@ -839,6 +948,14 @@ def train_agent(
         "layout_config": asdict(layout_cfg),
         "sim_config": asdict(sim_cfg),
         "train_config": asdict(train_cfg),
+        "observation_version": OBSERVATION_VERSION,
+        "observation_dim": int(AUVNavigationRLEnv(layout_cfg, sim_cfg).observation_space.shape[0]),
+        "observation_notes": [
+            "velocity vector normalized by max_speed",
+            "target error vector and target distance",
+            "latitude/f/enabled Coriolis context",
+            "wall margins and nearest obstacle blocks",
+        ],
     }
     (save_dir / "training_config.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -969,6 +1086,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obstacle-complexity", type=float, default=0.015)
     parser.add_argument("--env-size", type=float, nargs=3, default=(30.0, 30.0, 12.0))
     parser.add_argument("--env-origin", type=float, nargs=3, default=(-15.0, -15.0, 0.0))
+    parser.add_argument("--latitude-deg", type=float, default=36.0, help="Fixed local latitude used for the Coriolis term.")
+    parser.add_argument(
+        "--latitude-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LAT_MIN", "LAT_MAX"),
+        help="Optional per-episode latitude sampling range in degrees.",
+    )
+    parser.add_argument("--disable-coriolis", action="store_true", help="Disable Coriolis acceleration in the environment.")
+    parser.add_argument("--coriolis-scale", type=float, default=1.0, help="Optional multiplier applied to the Coriolis term.")
     return parser
 
 
@@ -980,6 +1108,10 @@ def main() -> None:
     layout_cfg = LayoutConfig(
         size=tuple(float(v) for v in args.env_size),
         origin=tuple(float(v) for v in args.env_origin),
+        latitude_deg=float(args.latitude_deg),
+        latitude_deg_range=None if args.latitude_range is None else tuple(float(v) for v in args.latitude_range),
+        coriolis_enabled=not args.disable_coriolis,
+        coriolis_scale=float(args.coriolis_scale),
         obstacle_field=ObstacleFieldConfig(
             radius=float(args.obstacle_radius),
             count=obstacle_count,
