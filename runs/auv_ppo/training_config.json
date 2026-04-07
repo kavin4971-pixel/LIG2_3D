@@ -10,6 +10,11 @@
       -15.0,
       0.0
     ],
+    "latitude_deg": 36.0,
+    "latitude_deg_range": null,
+    "coriolis_enabled": true,
+    "traditional_coriolis": true,
+    "coriolis_scale": 1.0,
     "obstacle_field": {
       "radius": 1.35,
       "count": null,
@@ -85,5 +90,13 @@
         ]
       }
     }
-  }
+  },
+  "observation_version": 2,
+  "observation_dim": 91,
+  "observation_notes": [
+    "velocity vector normalized by max_speed",
+    "target error vector and target distance",
+    "latitude/f/enabled Coriolis context",
+    "wall margins and nearest obstacle blocks"
+  ]
 }
