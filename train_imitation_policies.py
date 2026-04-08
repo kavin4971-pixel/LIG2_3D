@@ -161,7 +161,10 @@ def require_training_dependencies() -> Dict[str, Any]:
         from imitation.algorithms import bc, dagger
         from imitation.data import types
         from imitation.data.wrappers import RolloutInfoWrapper
+        from stable_baselines3.common.policies import BasePolicy
+        from stable_baselines3.common.torch_layers import FlattenExtractor
         from stable_baselines3.common.vec_env import DummyVecEnv
+        from casadi_mpc_collect import CasadiREMUSMPC
     except ImportError as exc:
         raise SystemExit(
             "Missing training dependencies. Install them with:\n"
@@ -175,7 +178,10 @@ def require_training_dependencies() -> Dict[str, Any]:
         "dagger": dagger,
         "types": types,
         "RolloutInfoWrapper": RolloutInfoWrapper,
+        "BasePolicy": BasePolicy,
+        "FlattenExtractor": FlattenExtractor,
         "DummyVecEnv": DummyVecEnv,
+        "CasadiREMUSMPC": CasadiREMUSMPC,
     }
 
 
@@ -281,6 +287,53 @@ def make_vec_env(env_config: Dict[str, Any], seed: int, dummy_vec_env_cls: Any, 
         return _thunk
 
     return dummy_vec_env_cls([make_single_env(0)])
+
+
+def build_mpc_oracle_policy_class(base_policy_cls: Any, flatten_extractor_cls: Any, torch_mod: Any, mpc_cls: Any):
+    class MPCOraclePolicy(base_policy_cls):
+        def __init__(
+            self,
+            venv: Any,
+            observation_space: Any,
+            action_space: Any,
+            horizon: int,
+            replan_every: int,
+            plan_dt: Optional[float],
+        ) -> None:
+            super().__init__(
+                observation_space=observation_space,
+                action_space=action_space,
+                features_extractor_class=flatten_extractor_cls,
+                squash_output=False,
+            )
+            self.venv = venv
+            self._torch = torch_mod
+            self._controllers = [
+                mpc_cls(
+                    env=env.unwrapped,
+                    horizon=horizon,
+                    replan_every=replan_every,
+                    plan_dt=plan_dt,
+                )
+                for env in self.venv.envs
+            ]
+            self._last_step_counts = [None for _ in self._controllers]
+
+        def _predict(self, observation: Any, deterministic: bool = False) -> Any:
+            del deterministic
+            actions: List[np.ndarray] = []
+            for idx, wrapped_env in enumerate(self.venv.envs):
+                env = wrapped_env.unwrapped
+                if self._last_step_counts[idx] is None or int(env.step_count) == 0:
+                    self._controllers[idx].reset()
+                action = np.asarray(self._controllers[idx].act(), dtype=np.float32)
+                actions.append(action)
+                self._last_step_counts[idx] = int(env.step_count)
+
+            actions_np = np.stack(actions, axis=0)
+            return self._torch.as_tensor(actions_np, device=observation.device)
+
+    return MPCOraclePolicy
 
 
 def evaluate_policy(policy: Any, env_config: Dict[str, Any], episodes: int, seed: int, name: str) -> EvalSummary:
@@ -440,7 +493,10 @@ def train_policies(args: argparse.Namespace) -> Dict[str, Any]:
     dagger = deps["dagger"]
     types_mod = deps["types"]
     rollout_info_wrapper_cls = deps["RolloutInfoWrapper"]
+    base_policy_cls = deps["BasePolicy"]
+    flatten_extractor_cls = deps["FlattenExtractor"]
     dummy_vec_env_cls = deps["DummyVecEnv"]
+    casadi_mpc_cls = deps["CasadiREMUSMPC"]
 
     dataset_dir = args.dataset_dir.resolve()
     if args.batch_size % args.minibatch_size != 0:
@@ -526,6 +582,20 @@ def train_policies(args: argparse.Namespace) -> Dict[str, Any]:
         dummy_vec_env_cls=dummy_vec_env_cls,
         rollout_info_wrapper_cls=rollout_info_wrapper_cls,
     )
+    mpc_oracle_policy_cls = build_mpc_oracle_policy_class(
+        base_policy_cls=base_policy_cls,
+        flatten_extractor_cls=flatten_extractor_cls,
+        torch_mod=torch_mod,
+        mpc_cls=casadi_mpc_cls,
+    )
+    mpc_oracle_policy = mpc_oracle_policy_cls(
+        venv=venv,
+        observation_space=observation_space,
+        action_space=action_space,
+        horizon=int(dataset_config.get("horizon", args.oracle_horizon)),
+        replan_every=int(dataset_config.get("replan_every", args.oracle_replan_every)),
+        plan_dt=dataset_config.get("plan_dt", args.oracle_plan_dt),
+    )
     dagger_kwargs: Dict[str, Any] = {}
     if hasattr(dagger, "ExponentialBetaSchedule"):
         dagger_kwargs["beta_schedule"] = dagger.ExponentialBetaSchedule(args.dagger_beta_decay)
@@ -533,7 +603,7 @@ def train_policies(args: argparse.Namespace) -> Dict[str, Any]:
     dagger_trainer = dagger.SimpleDAggerTrainer(
         venv=venv,
         scratch_dir=dagger_scratch_dir,
-        expert_policy=bc_trainer.policy,
+        expert_policy=mpc_oracle_policy,
         expert_trajs=dagger_seed_trajs,
         rng=np.random.default_rng(args.seed + 2),
         bc_trainer=dagger_student_bc,
@@ -588,14 +658,17 @@ def train_policies(args: argparse.Namespace) -> Dict[str, Any]:
             "dagger_bc_epochs": args.dagger_bc_epochs,
             "dagger_beta_decay": args.dagger_beta_decay,
             "device": args.device,
+            "oracle_horizon": int(dataset_config.get("horizon", args.oracle_horizon)),
+            "oracle_replan_every": int(dataset_config.get("replan_every", args.oracle_replan_every)),
+            "oracle_plan_dt": dataset_config.get("plan_dt", args.oracle_plan_dt),
         },
         "evaluation": {
             "bc": asdict(bc_eval),
             "dagger": asdict(dagger_eval),
         },
         "notes": {
-            "dagger_expert_source": "BC policy trained on the provided expert dataset",
-            "reason": "The original dataset contains demonstrations but not a directly queryable expert policy.",
+            "dagger_expert_source": "Actual CasadiREMUSMPC oracle queried on learner rollout states",
+            "dagger_seed_data": "Initial expert trajectories loaded from the provided HDF5 dataset",
         },
     }
     save_json(run_dir / "train_summary.json", summary)
@@ -695,6 +768,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Number of expert trajectories to seed into round 0 of DAgger. Use <=0 for all selected trajectories.",
+    )
+    parser.add_argument(
+        "--oracle-horizon",
+        type=int,
+        default=12,
+        help="Fallback MPC horizon when config.json does not specify one.",
+    )
+    parser.add_argument(
+        "--oracle-replan-every",
+        type=int,
+        default=3,
+        help="Fallback MPC replanning interval when config.json does not specify one.",
+    )
+    parser.add_argument(
+        "--oracle-plan-dt",
+        type=float,
+        default=None,
+        help="Fallback MPC planning dt when config.json does not specify one.",
     )
     parser.add_argument(
         "--eval-episodes",
