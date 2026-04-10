@@ -2,10 +2,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
-
 import gymnasium as gym
 from gymnasium import spaces
-
 
 
 def wrap_angle(angle: float) -> float:
@@ -69,22 +67,15 @@ class Obstacle:
 
 class REMUSAUVEnv(gym.Env):
     """
-    REMUS-style AUV environment with:
-      - 6DOF rigid-body + added-mass inspired dynamics
-      - Coriolis / centripetal terms
-      - linear + quadratic drag based on relative flow
-      - buoyancy / restoring force
-      - moving spherical obstacles
-      - ocean current disturbance
-      - improved control-surface model using dynamic pressure / lift
-      - actuator saturation and rate limits
+    REMUS-style AUV environment for a fixed terminal-navigation mission.
 
-    State:
-      eta = [x, y, z, phi, theta, psi]
-      nu  = [u, v, w, p, q, r]
+    Mission setup in this version:
+      - start = [-40, -40, 10] m
+      - target = [40, 40, 50] m
+      - straight-line distance = 120 m
 
-    Action (normalized to [-1, 1]):
-      [propeller_cmd, rudder_cmd, stern_plane_cmd]
+    The vehicle geometry remains REMUS-like, while the workspace is sized for
+    local terminal navigation with moving obstacles and current disturbance.
     """
 
     metadata = {"render_modes": []}
@@ -92,8 +83,8 @@ class REMUSAUVEnv(gym.Env):
     def __init__(
         self,
         dt: float = 0.05,
-        max_steps: int = 1200,
-        world_size: float = 10.0,
+        max_steps: int = 2400,
+        world_size: float = 60.0,
         n_obstacles: int = 6,
         seed: Optional[int] = None,
         current_enabled: bool = True,
@@ -136,10 +127,21 @@ class REMUSAUVEnv(gym.Env):
         self.D_lin = np.diag([10.0, 55.0, 55.0, 0.25, 8.0, 8.0])
         self.D_quad = np.array([18.0, 95.0, 95.0, 0.35, 12.0, 12.0], dtype=np.float64)
 
+        # The 3 m/s operating point needs stronger passive lateral / yaw damping
+        # than the original low-thrust setup. Without this retuning, the vehicle
+        # becomes directionally underdamped and can spin up even with zero rudder.
+        self.D_lin[1] *= 6.0
+        self.D_quad[1] *= 6.0
+        self.D_lin[5] *= 10.0
+        self.D_quad[5] *= 10.0
+
         # -------------------------------------------------
         # Actuator limits / dynamics
         # -------------------------------------------------
-        self.max_thrust = 55.0                      # N (forward)
+        # Chosen so that the nominal surge equilibrium is close to 3 m/s
+        # after accounting for the hull drag model and the zero-lift drag of the
+        # stern/rudder surfaces.
+        self.max_thrust = 210.0                     # N (forward)
         self.max_reverse_propeller = 0.25          # reverse throttle saturation in normalized units
         self.max_rudder = np.deg2rad(25.0)         # rad
         self.max_stern_plane = np.deg2rad(25.0)    # rad
@@ -169,12 +171,27 @@ class REMUSAUVEnv(gym.Env):
         self.current_phase = np.zeros(3, dtype=np.float64)
         self.current_inertial = np.zeros(3, dtype=np.float64)
 
-        # Obstacles and terminal radii
-        self.auv_radius = 0.10
-        self.goal_radius = 0.35
+        # -------------------------------------------------
+        # Vehicle geometry / task scales
+        # -------------------------------------------------
+        # Realistic REMUS-like hull geometry
+        self.auv_length = 1.60                      # m
+        self.auv_diameter = 0.19                    # m
+        self.auv_hull_radius = 0.5 * self.auv_diameter
+
+        # Spherical approximation used by the environment for collision checks.
+        # Slightly inflated above the bare hull radius to account for the fact that
+        # we are approximating a 1.6 m long body with a sphere.
+        self.auv_radius = 0.25                      # m (effective collision radius)
+
+        # Fixed terminal-navigation mission (120 m straight-line separation).
+        self.goal_radius = 1.25                     # m
+        self.fixed_start = np.array([-40.0, -40.0, 10.0], dtype=np.float64)
+        self.fixed_target = np.array([40.0, 40.0, 50.0], dtype=np.float64)
+        self.fixed_mission_distance = float(np.linalg.norm(self.fixed_target - self.fixed_start))
 
         # Numerics / safety
-        self.velocity_clip = np.array([3.0, 2.5, 2.5, 1.2, 1.2, 1.5], dtype=np.float64)
+        self.velocity_clip = np.array([3.6, 3.0, 3.0, 1.4, 1.4, 1.8], dtype=np.float64)
         self.theta_limit = np.deg2rad(50.0)
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
@@ -201,7 +218,7 @@ class REMUSAUVEnv(gym.Env):
     # -------------------------------------------------
     # Sampling utilities
     # -------------------------------------------------
-    def _sample_point(self, z_low: float = 1.0, z_high: float = 8.0) -> np.ndarray:
+    def _sample_point(self, z_low: float = 5.0, z_high: float = 25.0) -> np.ndarray:
         return np.array(
             [
                 self.rng.uniform(-self.world_size, self.world_size),
@@ -211,29 +228,22 @@ class REMUSAUVEnv(gym.Env):
             dtype=np.float64,
         )
 
-    def _generate_start_target(self) -> tuple[np.ndarray, np.ndarray]:
-        for _ in range(1000):
-            start = self._sample_point()
-            target = self._sample_point()
-            if np.linalg.norm(start - target) > 6.0:
-                return start, target
-        raise RuntimeError("Failed to sample start/target")
 
     def _generate_obstacles(self) -> List[Obstacle]:
         obstacles: List[Obstacle] = []
         for _ in range(self.n_obstacles):
-            for _ in range(500):
-                center = self._sample_point()
-                radius = self.rng.uniform(0.25, 0.60)
+            for _ in range(1000):
+                center = self._sample_point(z_low=4.0, z_high=28.0)
+                radius = self.rng.uniform(0.8, 2.5)
 
-                if np.linalg.norm(center - self.target) < (radius + 0.1):
+                if np.linalg.norm(center - self.target) < (radius + self.goal_radius + 1.5):
                     continue
-                if np.linalg.norm(center - self.start) < (radius + 0.7):
+                if np.linalg.norm(center - self.start) < (radius + self.auv_length + 1.5):
                     continue
 
                 valid = True
                 for obs in obstacles:
-                    if np.linalg.norm(center - obs.center) < (radius + obs.radius + 0.3):
+                    if np.linalg.norm(center - obs.center) < (radius + obs.radius + 1.0):
                         valid = False
                         break
                 if not valid:
@@ -241,7 +251,7 @@ class REMUSAUVEnv(gym.Env):
 
                 direction = self.rng.normal(size=3)
                 direction /= np.linalg.norm(direction) + 1e-8
-                speed = self.rng.uniform(0.03, 0.15)
+                speed = self.rng.uniform(0.05, 0.20)
                 obstacles.append(Obstacle(center=center, velocity=direction * speed, radius=radius))
                 break
         return obstacles
@@ -368,10 +378,8 @@ class REMUSAUVEnv(gym.Env):
         propeller_cmd, rudder_angle, stern_angle = self.actuator_state
         u_r, v_r, w_r, _, _, _ = nu_r
 
-        # Nonlinear propeller thrust with reverse saturation.
         x_prop = self.max_thrust * np.sign(propeller_cmd) * (propeller_cmd ** 2)
 
-        # Rudder model: sway/yaw generated by lateral lift using relative flow.
         beta = np.arctan2(v_r, max(abs(u_r), 1e-4))
         alpha_rudder = rudder_angle - beta
         q_lat = 0.5 * self.rho * (u_r ** 2 + v_r ** 2)
@@ -381,7 +389,6 @@ class REMUSAUVEnv(gym.Env):
         x_rudder_drag = -q_lat * self.rudder_area * cd_r
         n_rudder = self.rudder_arm * y_rudder
 
-        # Stern plane model: heave/pitch generated by vertical lift using relative flow.
         gamma = np.arctan2(w_r, max(abs(u_r), 1e-4))
         alpha_stern = stern_angle + gamma
         q_vert = 0.5 * self.rho * (u_r ** 2 + w_r ** 2)
@@ -421,7 +428,6 @@ class REMUSAUVEnv(gym.Env):
         nu_next = nu + self.dt * nu_dot
         nu_next = np.clip(nu_next, -self.velocity_clip, self.velocity_clip)
 
-        # Semi-implicit update improves stability slightly for this environment.
         eta_dot = self._kinematics(eta, nu_next)
         eta_next = eta + self.dt * eta_dot
         eta_next[3] = wrap_angle(eta_next[3])
@@ -450,7 +456,7 @@ class REMUSAUVEnv(gym.Env):
 
             vec_to_target = obs.center - self.target
             dist_to_target = np.linalg.norm(vec_to_target)
-            min_dist_to_target = obs.radius + 0.1
+            min_dist_to_target = obs.radius + self.goal_radius + 0.5
             if dist_to_target < min_dist_to_target:
                 normal = vec_to_target / (dist_to_target + 1e-8)
                 obs.center = self.target + normal * min_dist_to_target
@@ -537,10 +543,9 @@ class REMUSAUVEnv(gym.Env):
         dist_now = np.linalg.norm(pos - self.target)
         progress = dist_prev - dist_now
 
-        reward = 12.0 * progress
-        reward -= 0.004  # mild time penalty
+        reward = 8.0 * progress
+        reward -= 0.004
 
-        # Penalize excessive actuator usage and command chattering.
         actuator_norm = self._normalized_actuator_state()
         reward -= 0.015 * (actuator_norm[0] ** 2)
         reward -= 0.004 * (actuator_norm[1] ** 2 + actuator_norm[2] ** 2)
@@ -554,8 +559,8 @@ class REMUSAUVEnv(gym.Env):
         for obs in self.obstacles:
             clearance = np.linalg.norm(pos - obs.center) - (self.auv_radius + obs.radius)
             min_clearance = min(min_clearance, clearance)
-        if min_clearance < 0.6:
-            reward -= 0.8 * (0.6 - min_clearance)
+        if min_clearance < 1.5:
+            reward -= 0.4 * (1.5 - min_clearance)
 
         return float(reward)
 
@@ -567,13 +572,15 @@ class REMUSAUVEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        self.start, self.target = self._generate_start_target()
+        self.start = self.fixed_start.copy()
+        self.target = self.fixed_target.copy()
 
         eta = np.zeros(6, dtype=np.float64)
         eta[:3] = self.start
-        eta[3] = self.rng.uniform(-0.03, 0.03)      # small roll
-        eta[4] = self.rng.uniform(-0.05, 0.05)      # small pitch
-        eta[5] = self.rng.uniform(-np.pi, np.pi)    # arbitrary yaw
+        eta[3] = self.rng.uniform(-0.03, 0.03)
+        eta[4] = self.rng.uniform(-0.05, 0.05)
+        yaw_to_target = np.arctan2(self.target[1] - self.start[1], self.target[0] - self.start[0])
+        eta[5] = yaw_to_target
 
         nu = np.zeros(6, dtype=np.float64)
         self.state = np.concatenate([eta, nu])
@@ -587,6 +594,7 @@ class REMUSAUVEnv(gym.Env):
         return self._get_obs(), {
             "start": self.start.copy(),
             "target": self.target.copy(),
+            "mission_distance": self.fixed_mission_distance,
             "current_inertial": self.current_inertial.copy(),
         }
 
