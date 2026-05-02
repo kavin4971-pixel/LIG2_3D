@@ -1,0 +1,78 @@
+{
+  "run_version": "Transformer PPO REMUS diagnostics v1 | logs train/eval metrics, episode diagnostics, reward components, obstacle clearance, path quality",
+  "run_dir": "checkpoints_transformer_remus\\runs\\20260427_161153",
+  "checkpoint_dir": "checkpoints_transformer_remus",
+  "ppo_config": {
+    "total_steps": 300000,
+    "rollout_steps": 4096,
+    "seq_len": 32,
+    "gamma": 0.995,
+    "gae_lambda": 0.97,
+    "clip_eps": 0.2,
+    "value_coef": 0.5,
+    "entropy_coef": 0.001,
+    "max_grad_norm": 0.5,
+    "learning_rate": 0.0001,
+    "update_epochs": 10,
+    "minibatch_size": 256,
+    "d_model": 128,
+    "n_heads": 4,
+    "n_layers": 3,
+    "dropout": 0.1,
+    "init_log_std": -1.0,
+    "seed": 42,
+    "eval_every_updates": 5,
+    "eval_episodes": 5,
+    "curriculum_gate_consecutive_evals": 2,
+    "device": "cuda",
+    "save_dir": "./checkpoints_transformer_remus",
+    "run_dir": "",
+    "log_csv": true,
+    "run_version": "Transformer PPO REMUS diagnostics v1 | logs train/eval metrics, episode diagnostics, reward components, obstacle clearance, path quality",
+    "clip_obs": 10.0
+  },
+  "reward_config": {
+    "progress_weight": 10.0,
+    "step_penalty": 0.006,
+    "action_l2_weight": 0.012,
+    "action_smooth_weight": 0.004,
+    "roll_weight": 0.02,
+    "pitch_weight": 0.05,
+    "obstacle_weight": 0.5,
+    "obstacle_margin": 1.5,
+    "orbit_penalty_weight": 1.0,
+    "orbit_window": 16,
+    "orbit_progress_eps_norm": 0.003,
+    "orbit_yaw_eps": 0.3490658503988659,
+    "goal_bonus": 800.0,
+    "collision_penalty": 160.0,
+    "out_of_bounds_penalty": 80.0,
+    "timeout_penalty": 80.0
+  },
+  "curriculum": [
+    {
+      "stage_id": 1,
+      "n_obstacles": 0,
+      "target_z_min": 7.0,
+      "target_z_max": 18.0,
+      "label": "2.5D_no_obstacles",
+      "success_gate": 0.6
+    },
+    {
+      "stage_id": 2,
+      "n_obstacles": 0,
+      "target_z_min": 5.0,
+      "target_z_max": 55.0,
+      "label": "3D_no_obstacles",
+      "success_gate": 0.75
+    },
+    {
+      "stage_id": 3,
+      "n_obstacles": 6,
+      "target_z_min": 5.0,
+      "target_z_max": 55.0,
+      "label": "3D_with_obstacles",
+      "success_gate": null
+    }
+  ]
+}

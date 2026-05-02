@@ -10,6 +10,18 @@ def wrap_angle(angle: float) -> float:
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
+def skew(v: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(v, dtype=np.float64)
+    return np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 def rotation_matrix_body_to_inertial(phi: float, theta: float, psi: float) -> np.ndarray:
     cphi, sphi = np.cos(phi), np.sin(phi)
     cth, sth = np.cos(theta), np.sin(theta)
@@ -58,6 +70,13 @@ def rate_limit(current_value: float, desired_value: float, max_rate: float, dt: 
     return current_value + delta
 
 
+def first_order_rate_limited(current_value: float, desired_value: float, time_constant: float, max_rate: float, dt: float) -> float:
+    time_constant = max(float(time_constant), 1e-6)
+    desired_rate = (desired_value - current_value) / time_constant
+    desired_rate = np.clip(desired_rate, -max_rate, max_rate)
+    return current_value + dt * desired_rate
+
+
 @dataclass
 class Obstacle:
     center: np.ndarray
@@ -67,15 +86,13 @@ class Obstacle:
 
 class REMUSAUVEnv(gym.Env):
     """
-    REMUS-style AUV environment for a fixed terminal-navigation mission.
+    REMUS-style AUV environment with a fixed start point and randomized target per episode.
 
-    Mission setup in this version:
-      - start = [-40, -40, 10] m
-      - target = [40, 40, 50] m
-      - straight-line distance = 120 m
-
-    The vehicle geometry remains REMUS-like, while the workspace is sized for
-    local terminal navigation with moving obstacles and current disturbance.
+    Compared to the baseline version, this variant includes:
+      - hull lift / moment terms based on angle of attack and sideslip
+      - cross-flow nonlinear maneuvering damping for sway/heave/yaw/pitch
+      - full 6x6 added-mass matrix with sway-yaw and heave-pitch coupling
+      - first-order actuator lag and propeller RPM state with KT/KQ model
     """
 
     metadata = {"render_modes": []}
@@ -89,6 +106,9 @@ class REMUSAUVEnv(gym.Env):
         seed: Optional[int] = None,
         current_enabled: bool = True,
         include_current_in_obs: bool = True,
+        fixed_mid_obstacle: bool = False,
+        fixed_obstacle_radius: float = 6.0,
+        fixed_obstacle_center: Optional[np.ndarray] = None,
     ):
         super().__init__()
 
@@ -98,6 +118,9 @@ class REMUSAUVEnv(gym.Env):
         self.n_obstacles = n_obstacles
         self.current_enabled = current_enabled
         self.include_current_in_obs = include_current_in_obs
+        self.fixed_mid_obstacle = fixed_mid_obstacle
+        self.fixed_obstacle_radius = float(fixed_obstacle_radius)
+        self.fixed_obstacle_center = None if fixed_obstacle_center is None else np.asarray(fixed_obstacle_center, dtype=np.float64)
         self.rng = np.random.default_rng(seed)
 
         # -------------------------------------------------
@@ -115,50 +138,117 @@ class REMUSAUVEnv(gym.Env):
 
         # Center of gravity / buoyancy
         self.r_g = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        self.r_b = np.array([0.0, 0.0, -0.01], dtype=np.float64)
+        # Body z is positive downward, so negative z_b places buoyancy above CG.
+        # A few cm of separation damps the roll-to-pitch depth coupling that was
+        # too strong under sustained propeller reaction torque.
+        self.r_b = np.array([0.0, 0.0, -0.03], dtype=np.float64)
 
-        # Mass-like matrices (diagonal approximation)
-        self.MRB_diag = np.array([self.m, self.m, self.m, self.Ix, self.Iy, self.Iz], dtype=np.float64)
-        self.MA_diag = np.array([8.0, 45.0, 45.0, 0.05, 4.0, 4.0], dtype=np.float64)
-        self.M_diag = self.MRB_diag + self.MA_diag
-        self.M_inv = np.diag(1.0 / self.M_diag)
+        # -------------------------------------------------
+        # Vehicle geometry / task scales
+        # -------------------------------------------------
+        self.auv_length = 1.60
+        self.auv_diameter = 0.19
+        self.auv_hull_radius = 0.5 * self.auv_diameter
+        self.auv_radius = 0.25
 
-        # Relative-flow drag
-        self.D_lin = np.diag([10.0, 55.0, 55.0, 0.25, 8.0, 8.0])
-        self.D_quad = np.array([18.0, 95.0, 95.0, 0.35, 12.0, 12.0], dtype=np.float64)
+        self.goal_radius = 1.25
+        self.fixed_start = np.array([-40.0, -40.0, 10.0], dtype=np.float64)
+        self.target_z_min = 5.0
+        self.target_z_max = 55.0
+        self.min_start_target_distance = 30.0
+        self.max_start_target_distance: Optional[float] = None
+        self.target_boundary_margin = 5.0
 
-        # The 3 m/s operating point needs stronger passive lateral / yaw damping
-        # than the original low-thrust setup. Without this retuning, the vehicle
-        # becomes directionally underdamped and can spin up even with zero rudder.
-        self.D_lin[1] *= 6.0
-        self.D_quad[1] *= 6.0
-        self.D_lin[5] *= 10.0
-        self.D_quad[5] *= 10.0
+        # -------------------------------------------------
+        # Full rigid-body / added-mass model
+        # -------------------------------------------------
+        self.MRB = np.diag([self.m, self.m, self.m, self.Ix, self.Iy, self.Iz]).astype(np.float64)
+
+        # Added-mass couplings: heave-pitch and sway-yaw are the dominant ones.
+        self.MA = np.array(
+            [
+                [8.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 45.0, 0.0, 0.0, 0.0, 4.5],
+                [0.0, 0.0, 45.0, 0.0, -4.5, 0.0],
+                [0.0, 0.0, 0.0, 0.08, 0.0, 0.0],
+                [0.0, 0.0, -4.5, 0.0, 4.6, 0.0],
+                [0.0, 4.5, 0.0, 0.0, 0.0, 4.6],
+            ],
+            dtype=np.float64,
+        )
+        self.M = self.MRB + self.MA
+        self.M_inv = np.linalg.inv(self.M)
+
+        # -------------------------------------------------
+        # Residual drag + maneuvering + hull-lift model
+        # -------------------------------------------------
+        # Residual axial/rotational damping kept modest because cross-flow and
+        # hull-lift terms now carry most of the sway/heave/yaw/pitch physics.
+        self.D_res_lin = np.diag([9.0, 3.0, 3.0, 0.08, 0.8, 0.8])
+        self.D_res_quad = np.array([14.0, 10.0, 10.0, 0.10, 1.0, 1.0], dtype=np.float64)
+
+        self.hull_ref_area = self.auv_length * self.auv_diameter
+        self.hull_cd0 = 0.20
+        self.hull_cd_alpha2 = 2.4
+        self.hull_cd_beta2 = 2.0
+
+        self.hull_cz_alpha = 1.15
+        self.hull_cm_alpha = 0.32
+        self.hull_cz_q = 0.82
+        self.hull_cm_q = 0.48
+
+        self.hull_cy_beta = 1.05
+        self.hull_cn_beta = 0.30
+        self.hull_cy_r = 0.72
+        self.hull_cn_r = 0.42
+
+        self.crossflow_cd = 1.10
+        self.crossflow_sections = 17
 
         # -------------------------------------------------
         # Actuator limits / dynamics
         # -------------------------------------------------
-        # Chosen so that the nominal surge equilibrium is close to 3 m/s
-        # after accounting for the hull drag model and the zero-lift drag of the
-        # stern/rudder surfaces.
-        self.max_thrust = 210.0                     # N (forward)
-        self.max_reverse_propeller = 0.25          # reverse throttle saturation in normalized units
-        self.max_rudder = np.deg2rad(25.0)         # rad
-        self.max_stern_plane = np.deg2rad(25.0)    # rad
+        self.max_rudder = np.deg2rad(25.0)
+        self.max_stern_plane = np.deg2rad(25.0)
+        self.max_reverse_propeller = 0.25
 
-        self.propeller_rate_limit = 0.80           # normalized command per second
-        self.rudder_rate_limit = np.deg2rad(45.0)  # rad/s
-        self.stern_rate_limit = np.deg2rad(45.0)   # rad/s
+        self.max_propeller_rps = 35.0
+        self.min_propeller_rps = -6.0
+        self.propeller_time_constant = 0.45
+        self.propeller_rps_rate_limit = 35.0
+        self.propeller_deadband = 0.03
 
-        # Control-surface model (dynamic-pressure/lift based)
-        self.fin_cl_alpha = 3.0                    # lift slope [1/rad]
+        self.rudder_time_constant = 0.18
+        self.stern_time_constant = 0.18
+        self.rudder_rate_limit = np.deg2rad(45.0)
+        self.stern_rate_limit = np.deg2rad(45.0)
+        self.control_surface_deadband = np.deg2rad(0.4)
+
+        # Propeller/open-water model
+        self.propeller_diameter = 0.18
+        self.propeller_wake_fraction = 0.18
+        self.propeller_thrust_deduction = 0.06
+        self.kt0 = 0.20
+        self.kt1 = 0.085
+        self.kq0 = 0.028
+        self.kq1 = 0.014
+        self.propeller_reverse_efficiency = 0.55
+        self.max_thrust = 320.0
+        # Net reaction torque after motor/stator/hull cancellation. Without this
+        # attenuation the small roll angle leaks into pitch/depth too strongly.
+        self.propeller_reaction_torque_scale = 0.25
+        self.max_propeller_torque = 0.12
+
+        # Control-surface model (dynamic-pressure / lift based)
+        self.fin_cl_alpha = 3.0
         self.fin_cd0 = 0.05
         self.fin_cd2 = 1.6
         self.fin_stall_angle = np.deg2rad(18.0)
-        self.rudder_area = 0.018                   # m^2
-        self.stern_area = 0.020                    # m^2
-        self.rudder_arm = 0.75                     # m behind CG
-        self.stern_arm = 0.75                      # m behind CG
+        self.rudder_area = 0.018
+        self.stern_area = 0.020
+        self.rudder_arm = 0.75
+        self.stern_arm = 0.75
+        self.slipstream_gain = 0.55
 
         # Ocean current profile (sampled per episode, slowly varying)
         self.current_speed_min = 0.05
@@ -171,48 +261,37 @@ class REMUSAUVEnv(gym.Env):
         self.current_phase = np.zeros(3, dtype=np.float64)
         self.current_inertial = np.zeros(3, dtype=np.float64)
 
-        # -------------------------------------------------
-        # Vehicle geometry / task scales
-        # -------------------------------------------------
-        # Realistic REMUS-like hull geometry
-        self.auv_length = 1.60                      # m
-        self.auv_diameter = 0.19                    # m
-        self.auv_hull_radius = 0.5 * self.auv_diameter
-
-        # Spherical approximation used by the environment for collision checks.
-        # Slightly inflated above the bare hull radius to account for the fact that
-        # we are approximating a 1.6 m long body with a sphere.
-        self.auv_radius = 0.25                      # m (effective collision radius)
-
-        # Fixed terminal-navigation mission (120 m straight-line separation).
-        self.goal_radius = 1.25                     # m
-        self.fixed_start = np.array([-40.0, -40.0, 10.0], dtype=np.float64)
-        self.fixed_target = np.array([40.0, 40.0, 50.0], dtype=np.float64)
-        self.fixed_mission_distance = float(np.linalg.norm(self.fixed_target - self.fixed_start))
+        # Obstacle sampling profile. Later curriculum stages can tighten these
+        # around the mission path to create a meaningful moving-obstacle test.
+        self.obstacle_radius_min = 0.8
+        self.obstacle_radius_max = 2.5
+        self.obstacle_speed_min = 0.05
+        self.obstacle_speed_max = 0.20
+        self.prefer_path_obstacles = False
+        self.obstacle_path_lateral_jitter = 12.0
+        self.obstacle_path_depth_jitter = 8.0
+        self.obstacle_path_fraction_min = 0.15
+        self.obstacle_path_fraction_max = 0.85
 
         # Numerics / safety
-        self.velocity_clip = np.array([3.6, 3.0, 3.0, 1.4, 1.4, 1.8], dtype=np.float64)
+        self.velocity_clip = np.array([3.6, 3.0, 3.0, 1.2, 1.2, 1.4], dtype=np.float64)
         self.theta_limit = np.deg2rad(50.0)
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
-        obs_dim = 6 + 6 + 3 + 3 + 12  # eta + nu + rel_target_body + actuator_state + nearest obstacles
+        obs_dim = 6 + 6 + 3 + 3 + 12
         if self.include_current_in_obs:
             obs_dim += 3
 
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.state: Optional[np.ndarray] = None
         self.start: Optional[np.ndarray] = None
         self.target: Optional[np.ndarray] = None
         self.obstacles: List[Obstacle] = []
         self.step_count = 0
-        self.actuator_state = np.zeros(3, dtype=np.float64)  # [propeller_norm, rudder_angle, stern_angle]
+        # [propeller_rps, rudder_angle, stern_angle]
+        self.actuator_state = np.zeros(3, dtype=np.float64)
         self.last_action = np.zeros(3, dtype=np.float64)
 
     # -------------------------------------------------
@@ -228,13 +307,130 @@ class REMUSAUVEnv(gym.Env):
             dtype=np.float64,
         )
 
+    def _fixed_mid_obstacle(self) -> Obstacle:
+        if self.fixed_obstacle_center is not None:
+            center = self.fixed_obstacle_center.astype(np.float64).copy()
+        else:
+            start = self.start if self.start is not None else self.fixed_start
+            target = self.target if self.target is not None else np.array(
+                [0.5 * self.world_size, 0.5 * self.world_size, self.target_z_max],
+                dtype=np.float64,
+            )
+            center = 0.5 * (start + target)
+        center[2] = float(np.clip(center[2], 4.0, self.world_size - 4.0))
+        return Obstacle(
+            center=center,
+            velocity=np.zeros(3, dtype=np.float64),
+            radius=float(self.fixed_obstacle_radius),
+        )
+
+    def _target_xy_limit(self) -> float:
+        margin = max(float(getattr(self, "target_boundary_margin", 0.0)), 0.0)
+        margin = min(margin, max(self.world_size - 1.0, 0.0))
+        return max(self.world_size - margin, 1.0)
+
+    def _target_has_boundary_margin(self, target: np.ndarray) -> bool:
+        return bool(np.all(np.abs(target[:2]) <= self._target_xy_limit()))
+
+    def _target_xy_margin(self, target: np.ndarray) -> float:
+        return float(self.world_size - np.max(np.abs(target[:2])))
+
+    def _sample_target(self) -> np.ndarray:
+        fallback_target: Optional[np.ndarray] = None
+        for _ in range(1000):
+            target = np.array(
+                [
+                    self.rng.uniform(-self.world_size, self.world_size),
+                    self.rng.uniform(-self.world_size, self.world_size),
+                    self.rng.uniform(self.target_z_min, self.target_z_max),
+                ],
+                dtype=np.float64,
+            )
+            distance = float(np.linalg.norm(target - self.fixed_start))
+            if not self._target_has_boundary_margin(target):
+                continue
+            if distance < self.min_start_target_distance:
+                continue
+            if self.max_start_target_distance is not None and distance > self.max_start_target_distance:
+                continue
+            if target[0] <= self.fixed_start[0] + 2.0:
+                continue
+            return target
+
+        for _ in range(1000):
+            distance_low = max(float(self.min_start_target_distance), 1.0)
+            distance_high = float(self.max_start_target_distance or min(self.world_size * 1.5, distance_low + 40.0))
+            distance_high = max(distance_high, distance_low + 1.0)
+            distance = self.rng.uniform(distance_low, distance_high)
+            yaw = self.rng.uniform(-0.45 * np.pi, 0.45 * np.pi)
+            horizontal = max(distance * self.rng.uniform(0.75, 1.0), 1.0)
+            target = np.array(
+                [
+                    self.fixed_start[0] + horizontal * np.cos(yaw),
+                    self.fixed_start[1] + horizontal * np.sin(yaw),
+                    self.rng.uniform(self.target_z_min, self.target_z_max),
+                ],
+                dtype=np.float64,
+            )
+            target[:2] = np.clip(target[:2], -self._target_xy_limit(), self._target_xy_limit())
+            target[2] = float(np.clip(target[2], 0.0, self.world_size))
+            fallback_target = target.copy()
+
+            distance = float(np.linalg.norm(target - self.fixed_start))
+            if distance < self.min_start_target_distance:
+                continue
+            if self.max_start_target_distance is not None and distance > self.max_start_target_distance:
+                continue
+            if target[0] <= self.fixed_start[0] + 2.0:
+                continue
+            return target
+
+        # Fallback: keep the target inside the configured boundary margin even if
+        # the distance constraints are unusually tight for a custom workspace.
+        if fallback_target is not None:
+            return fallback_target
+        return np.array(
+            [
+                min(self.fixed_start[0] + self.min_start_target_distance, self._target_xy_limit()),
+                float(np.clip(self.fixed_start[1], -self._target_xy_limit(), self._target_xy_limit())),
+                float(np.clip(0.5 * (self.target_z_min + self.target_z_max), 0.0, self.world_size)),
+            ],
+            dtype=np.float64,
+        )
+
+    def _sample_path_obstacle_center(self) -> np.ndarray:
+        mission_vec = self.target - self.start
+        mission_len = float(np.linalg.norm(mission_vec))
+        if mission_len < 1e-8:
+            return self._sample_point(z_low=10.0, z_high=60.0)
+
+        direction = mission_vec / mission_len
+        frac = self.rng.uniform(self.obstacle_path_fraction_min, self.obstacle_path_fraction_max)
+        center = self.start + frac * mission_vec
+
+        lateral = self.rng.normal(size=3)
+        lateral[2] = 0.0
+        lateral = lateral - np.dot(lateral, direction) * direction
+        lateral_norm = float(np.linalg.norm(lateral))
+        if lateral_norm < 1e-8:
+            lateral = np.array([-direction[1], direction[0], 0.0], dtype=np.float64)
+            lateral_norm = float(np.linalg.norm(lateral))
+        lateral = lateral / max(lateral_norm, 1e-8)
+
+        center = center + lateral * self.rng.uniform(-self.obstacle_path_lateral_jitter, self.obstacle_path_lateral_jitter)
+        center[2] += self.rng.uniform(-self.obstacle_path_depth_jitter, self.obstacle_path_depth_jitter)
+        center[:2] = np.clip(center[:2], -self.world_size, self.world_size)
+        center[2] = float(np.clip(center[2], 4.0, self.world_size - 4.0))
+        return center
 
     def _generate_obstacles(self) -> List[Obstacle]:
         obstacles: List[Obstacle] = []
+        if self.fixed_mid_obstacle:
+            obstacles.append(self._fixed_mid_obstacle())
         for _ in range(self.n_obstacles):
             for _ in range(1000):
-                center = self._sample_point(z_low=4.0, z_high=28.0)
-                radius = self.rng.uniform(0.8, 2.5)
+                center = self._sample_path_obstacle_center() if self.prefer_path_obstacles else self._sample_point(z_low=10.0, z_high=60.0)
+                radius = self.rng.uniform(self.obstacle_radius_min, self.obstacle_radius_max)
 
                 if np.linalg.norm(center - self.target) < (radius + self.goal_radius + 1.5):
                     continue
@@ -251,10 +447,23 @@ class REMUSAUVEnv(gym.Env):
 
                 direction = self.rng.normal(size=3)
                 direction /= np.linalg.norm(direction) + 1e-8
-                speed = self.rng.uniform(0.05, 0.20)
+                speed = self.rng.uniform(self.obstacle_speed_min, self.obstacle_speed_max)
                 obstacles.append(Obstacle(center=center, velocity=direction * speed, radius=radius))
                 break
         return obstacles
+
+    def _obstacle_arrays(self) -> Dict[str, np.ndarray]:
+        if not self.obstacles:
+            return {
+                "obstacle_centers": np.zeros((0, 3), dtype=np.float64),
+                "obstacle_velocities": np.zeros((0, 3), dtype=np.float64),
+                "obstacle_radii": np.zeros((0,), dtype=np.float64),
+            }
+        return {
+            "obstacle_centers": np.stack([obs.center.copy() for obs in self.obstacles], axis=0),
+            "obstacle_velocities": np.stack([obs.velocity.copy() for obs in self.obstacles], axis=0),
+            "obstacle_radii": np.asarray([obs.radius for obs in self.obstacles], dtype=np.float64),
+        }
 
     def _sample_current_profile(self) -> None:
         if not self.current_enabled:
@@ -282,23 +491,85 @@ class REMUSAUVEnv(gym.Env):
     # Dynamics helpers
     # -------------------------------------------------
     @staticmethod
-    def _coriolis_matrix_diag(m_diag: np.ndarray, nu: np.ndarray) -> np.ndarray:
-        u, v, w, p, q, r = nu
-        m1, m2, m3, i1, i2, i3 = m_diag
-        return np.array(
-            [
-                [0.0, 0.0, 0.0, 0.0, m3 * w, -m2 * v],
-                [0.0, 0.0, 0.0, -m3 * w, 0.0, m1 * u],
-                [0.0, 0.0, 0.0, m2 * v, -m1 * u, 0.0],
-                [0.0, m3 * w, -m2 * v, 0.0, i3 * r, -i2 * q],
-                [-m3 * w, 0.0, m1 * u, -i3 * r, 0.0, i1 * p],
-                [m2 * v, -m1 * u, 0.0, i2 * q, -i1 * p, 0.0],
-            ],
-            dtype=np.float64,
+    def _coriolis_from_mass_matrix(M: np.ndarray, nu: np.ndarray) -> np.ndarray:
+        nu1 = nu[:3]
+        nu2 = nu[3:]
+        M11 = M[:3, :3]
+        M12 = M[:3, 3:]
+        M21 = M[3:, :3]
+        M22 = M[3:, 3:]
+
+        a = M11 @ nu1 + M12 @ nu2
+        b = M21 @ nu1 + M22 @ nu2
+
+        C = np.zeros((6, 6), dtype=np.float64)
+        C[:3, 3:] = -skew(a)
+        C[3:, :3] = -skew(a)
+        C[3:, 3:] = -skew(b)
+        return C
+
+    def _residual_damping_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        return -(self.D_res_lin @ nu_r + self.D_res_quad * np.abs(nu_r) * nu_r)
+
+    def _flow_angles(self, nu_r: np.ndarray) -> tuple[float, float, float, float, float]:
+        u_r, v_r, w_r, _, q, r = nu_r
+        U = float(np.linalg.norm(nu_r[:3]))
+        u_ref = max(abs(u_r), 0.25)
+        alpha = np.arctan2(w_r, u_ref)
+        beta = np.arctan2(v_r, u_ref)
+        q_hat = q * self.auv_length / max(2.0 * U, 0.20)
+        r_hat = r * self.auv_length / max(2.0 * U, 0.20)
+        return U, alpha, beta, q_hat, r_hat
+
+    def _hull_lift_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        U, alpha, beta, q_hat, r_hat = self._flow_angles(nu_r)
+        if U < 0.05:
+            return np.zeros(6, dtype=np.float64)
+
+        q_dyn = 0.5 * self.rho * (U ** 2)
+        tau = np.zeros(6, dtype=np.float64)
+
+        x_drag = -q_dyn * self.hull_ref_area * (
+            self.hull_cd0 + self.hull_cd_alpha2 * (alpha ** 2) + self.hull_cd_beta2 * (beta ** 2)
+        )
+        z_force = -q_dyn * self.hull_ref_area * (self.hull_cz_alpha * alpha + self.hull_cz_q * q_hat)
+        m_moment = -q_dyn * self.hull_ref_area * self.auv_length * (
+            self.hull_cm_alpha * alpha + self.hull_cm_q * q_hat
+        )
+        y_force = -q_dyn * self.hull_ref_area * (self.hull_cy_beta * beta + self.hull_cy_r * r_hat)
+        n_moment = -q_dyn * self.hull_ref_area * self.auv_length * (
+            self.hull_cn_beta * beta + self.hull_cn_r * r_hat
         )
 
-    def _drag(self, nu_r: np.ndarray) -> np.ndarray:
-        return self.D_lin @ nu_r + self.D_quad * np.abs(nu_r) * nu_r
+        tau[0] = x_drag
+        tau[1] = y_force
+        tau[2] = z_force
+        tau[4] = m_moment
+        tau[5] = n_moment
+        return tau
+
+    def _crossflow_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        _, v_r, w_r, _, q, r = nu_r
+        tau = np.zeros(6, dtype=np.float64)
+        dx = self.auv_length / self.crossflow_sections
+        x_positions = np.linspace(-0.5 * self.auv_length + 0.5 * dx, 0.5 * self.auv_length - 0.5 * dx, self.crossflow_sections)
+
+        for x in x_positions:
+            v_local = v_r + x * r
+            w_local = w_r - x * q
+
+            dY = -0.5 * self.rho * self.crossflow_cd * self.auv_diameter * dx * abs(v_local) * v_local
+            dZ = -0.5 * self.rho * self.crossflow_cd * self.auv_diameter * dx * abs(w_local) * w_local
+
+            tau[1] += dY
+            tau[2] += dZ
+            tau[4] += -x * dZ
+            tau[5] += x * dY
+
+        return tau
+
+    def _hydrodynamic_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        return self._residual_damping_tau(nu_r) + self._hull_lift_tau(nu_r) + self._crossflow_tau(nu_r)
 
     def _restoring_force(self, eta: np.ndarray) -> np.ndarray:
         _, _, _, phi, theta, _ = eta
@@ -343,25 +614,43 @@ class REMUSAUVEnv(gym.Env):
         nu_r[:3] -= current_body
         return nu_r, current_body
 
+    def _map_propeller_command_to_rps(self, cmd: float) -> float:
+        if abs(cmd) < self.propeller_deadband:
+            return 0.0
+        if cmd >= 0.0:
+            return cmd * self.max_propeller_rps
+        return cmd * abs(self.min_propeller_rps)
+
+    def _apply_control_surface_deadband(self, desired_angle: float) -> float:
+        if abs(desired_angle) < self.control_surface_deadband:
+            return 0.0
+        return desired_angle
+
     def _update_actuators(self, action: np.ndarray) -> None:
         desired = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
 
-        desired_propeller = np.clip(desired[0], -self.max_reverse_propeller, 1.0)
-        desired_rudder = desired[1] * self.max_rudder
-        desired_stern = desired[2] * self.max_stern_plane
+        desired_propeller_rps = self._map_propeller_command_to_rps(float(np.clip(desired[0], -self.max_reverse_propeller, 1.0)))
+        desired_rudder = self._apply_control_surface_deadband(desired[1] * self.max_rudder)
+        desired_stern = self._apply_control_surface_deadband(desired[2] * self.max_stern_plane)
 
         self.actuator_state[0] = np.clip(
-            rate_limit(self.actuator_state[0], desired_propeller, self.propeller_rate_limit, self.dt),
-            -self.max_reverse_propeller,
-            1.0,
+            first_order_rate_limited(
+                self.actuator_state[0], desired_propeller_rps, self.propeller_time_constant, self.propeller_rps_rate_limit, self.dt
+            ),
+            self.min_propeller_rps,
+            self.max_propeller_rps,
         )
         self.actuator_state[1] = np.clip(
-            rate_limit(self.actuator_state[1], desired_rudder, self.rudder_rate_limit, self.dt),
+            first_order_rate_limited(
+                self.actuator_state[1], desired_rudder, self.rudder_time_constant, self.rudder_rate_limit, self.dt
+            ),
             -self.max_rudder,
             self.max_rudder,
         )
         self.actuator_state[2] = np.clip(
-            rate_limit(self.actuator_state[2], desired_stern, self.stern_rate_limit, self.dt),
+            first_order_rate_limited(
+                self.actuator_state[2], desired_stern, self.stern_time_constant, self.stern_rate_limit, self.dt
+            ),
             -self.max_stern_plane,
             self.max_stern_plane,
         )
@@ -374,24 +663,57 @@ class REMUSAUVEnv(gym.Env):
         alpha = np.clip(effective_alpha, -self.fin_stall_angle, self.fin_stall_angle)
         return self.fin_cd0 + self.fin_cd2 * (alpha ** 2)
 
-    def _control_to_tau(self, nu_r: np.ndarray) -> np.ndarray:
-        propeller_cmd, rudder_angle, stern_angle = self.actuator_state
+    def _propeller_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        n = float(self.actuator_state[0])
+        if abs(n) < 1e-5:
+            return np.zeros(6, dtype=np.float64)
+
+        u_r = float(nu_r[0])
+        sign_n = np.sign(n)
+        n_abs = abs(n)
+        wake_velocity = (1.0 - self.propeller_wake_fraction) * u_r
+        advance = wake_velocity / max(n_abs * self.propeller_diameter, 1e-4)
+
+        kt = max(self.kt0 - self.kt1 * advance, 0.02)
+        kq = max(self.kq0 - self.kq1 * advance, 0.005)
+
+        thrust = self.rho * (self.propeller_diameter ** 4) * kt * n_abs * n
+        torque = self.rho * (self.propeller_diameter ** 5) * kq * n_abs * sign_n
+
+        if n < 0.0:
+            thrust *= self.propeller_reverse_efficiency
+            torque *= self.propeller_reverse_efficiency
+
+        thrust *= (1.0 - self.propeller_thrust_deduction)
+        torque *= self.propeller_reaction_torque_scale
+        thrust = float(np.clip(thrust, -self.max_thrust * self.max_reverse_propeller, self.max_thrust))
+        torque = float(np.clip(torque, -self.max_propeller_torque, self.max_propeller_torque))
+
+        tau = np.zeros(6, dtype=np.float64)
+        tau[0] = thrust
+        tau[3] = -torque
+        return tau
+
+    def _control_surface_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        _, rudder_angle, stern_angle = self.actuator_state
         u_r, v_r, w_r, _, _, _ = nu_r
 
-        x_prop = self.max_thrust * np.sign(propeller_cmd) * (propeller_cmd ** 2)
+        slipstream_speed = self.slipstream_gain * abs(self.actuator_state[0]) * self.propeller_diameter
 
-        beta = np.arctan2(v_r, max(abs(u_r), 1e-4))
+        u_eff_rudder = np.sign(u_r if abs(u_r) > 1e-5 else 1.0) * np.sqrt(u_r ** 2 + slipstream_speed ** 2)
+        beta = np.arctan2(v_r, max(abs(u_eff_rudder), 1e-4))
         alpha_rudder = rudder_angle - beta
-        q_lat = 0.5 * self.rho * (u_r ** 2 + v_r ** 2)
+        q_lat = 0.5 * self.rho * (u_eff_rudder ** 2 + v_r ** 2)
         cl_r = self._lift_coefficient(alpha_rudder)
         cd_r = self._drag_coefficient(alpha_rudder)
         y_rudder = q_lat * self.rudder_area * cl_r
         x_rudder_drag = -q_lat * self.rudder_area * cd_r
         n_rudder = self.rudder_arm * y_rudder
 
-        gamma = np.arctan2(w_r, max(abs(u_r), 1e-4))
+        u_eff_stern = np.sign(u_r if abs(u_r) > 1e-5 else 1.0) * np.sqrt(u_r ** 2 + slipstream_speed ** 2)
+        gamma = np.arctan2(w_r, max(abs(u_eff_stern), 1e-4))
         alpha_stern = stern_angle + gamma
-        q_vert = 0.5 * self.rho * (u_r ** 2 + w_r ** 2)
+        q_vert = 0.5 * self.rho * (u_eff_stern ** 2 + w_r ** 2)
         cl_s = self._lift_coefficient(alpha_stern)
         cd_s = self._drag_coefficient(alpha_stern)
         z_stern = -q_vert * self.stern_area * cl_s
@@ -399,12 +721,15 @@ class REMUSAUVEnv(gym.Env):
         m_stern = self.stern_arm * z_stern
 
         tau = np.zeros(6, dtype=np.float64)
-        tau[0] = x_prop + x_rudder_drag + x_stern_drag
+        tau[0] = x_rudder_drag + x_stern_drag
         tau[1] = y_rudder
         tau[2] = z_stern
         tau[4] = m_stern
         tau[5] = n_rudder
         return tau
+
+    def _actuation_tau(self, nu_r: np.ndarray) -> np.ndarray:
+        return self._propeller_tau(nu_r) + self._control_surface_tau(nu_r)
 
     def _kinematics(self, eta: np.ndarray, nu: np.ndarray) -> np.ndarray:
         phi, theta, psi = eta[3], eta[4], eta[5]
@@ -415,15 +740,16 @@ class REMUSAUVEnv(gym.Env):
         ang_dot = t_mat @ np.array([p, q, r], dtype=np.float64)
         return np.concatenate([pos_dot, ang_dot])
 
-    def _integrate(self, eta: np.ndarray, nu: np.ndarray, tau: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _integrate(self, eta: np.ndarray, nu: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         nu_r, _ = self._relative_velocity(eta, nu)
 
-        c_rb = self._coriolis_matrix_diag(self.MRB_diag, nu)
-        c_a = self._coriolis_matrix_diag(self.MA_diag, nu_r)
-        drag = self._drag(nu_r)
+        c_rb = self._coriolis_from_mass_matrix(self.MRB, nu)
+        c_a = self._coriolis_from_mass_matrix(self.MA, nu_r)
         restoring = self._restoring_force(eta)
+        tau_hydro = self._hydrodynamic_tau(nu_r)
+        tau_act = self._actuation_tau(nu_r)
 
-        rhs = tau - (c_rb @ nu) - (c_a @ nu_r) - drag - restoring
+        rhs = tau_act + tau_hydro - (c_rb @ nu) - (c_a @ nu_r) - restoring
         nu_dot = self.M_inv @ rhs
         nu_next = nu + self.dt * nu_dot
         nu_next = np.clip(nu_next, -self.velocity_clip, self.velocity_clip)
@@ -489,9 +815,10 @@ class REMUSAUVEnv(gym.Env):
     # Observation / reward
     # -------------------------------------------------
     def _normalized_actuator_state(self) -> np.ndarray:
+        prop_norm = self.actuator_state[0] / (self.max_propeller_rps if self.actuator_state[0] >= 0.0 else abs(self.min_propeller_rps))
         return np.array(
             [
-                self.actuator_state[0],
+                np.clip(prop_norm, -1.0, 1.0),
                 self.actuator_state[1] / self.max_rudder,
                 self.actuator_state[2] / self.max_stern_plane,
             ],
@@ -538,31 +865,81 @@ class REMUSAUVEnv(gym.Env):
     def _out_of_bounds(self, pos: np.ndarray) -> bool:
         return np.any(np.abs(pos[:2]) > self.world_size) or pos[2] < 0.0 or pos[2] > self.world_size
 
-    def _reward(self, prev_pos: np.ndarray, pos: np.ndarray, action: np.ndarray) -> float:
-        dist_prev = np.linalg.norm(prev_pos - self.target)
-        dist_now = np.linalg.norm(pos - self.target)
-        progress = dist_prev - dist_now
+    def _workspace_margin(self, pos: np.ndarray) -> float:
+        xy_margin = self.world_size - float(np.max(np.abs(pos[:2])))
+        depth_margin = min(float(pos[2]), self.world_size - float(pos[2]))
+        return float(min(xy_margin, depth_margin))
 
-        reward = 8.0 * progress
-        reward -= 0.004
+    def _progress_metrics(self, prev_pos: np.ndarray, pos: np.ndarray) -> Dict[str, float]:
+        dist_prev = float(np.linalg.norm(prev_pos - self.target))
+        dist_now = float(np.linalg.norm(pos - self.target))
+        return {
+            "distance_to_goal": dist_now,
+            "progress": dist_prev - dist_now,
+        }
 
-        actuator_norm = self._normalized_actuator_state()
-        reward -= 0.015 * (actuator_norm[0] ** 2)
-        reward -= 0.004 * (actuator_norm[1] ** 2 + actuator_norm[2] ** 2)
-        reward -= 0.003 * np.sum((np.asarray(action) - self.last_action) ** 2)
+    def _nearest_obstacle_metrics(self, pos: np.ndarray) -> Dict[str, float]:
+        if not self.obstacles:
+            return {
+                "nearest_obstacle_distance": float("nan"),
+                "nearest_obstacle_radius": float("nan"),
+                "min_obstacle_clearance": float("nan"),
+            }
 
-        phi, theta = self.state[3], self.state[4]
-        reward -= 0.03 * abs(phi)
-        reward -= 0.08 * abs(theta)
-
-        min_clearance = np.inf
+        nearest_distance = float("inf")
+        nearest_radius = 0.0
+        min_clearance = float("inf")
         for obs in self.obstacles:
-            clearance = np.linalg.norm(pos - obs.center) - (self.auv_radius + obs.radius)
+            center_distance = float(np.linalg.norm(pos - obs.center))
+            clearance = center_distance - (self.auv_radius + obs.radius)
+            if center_distance < nearest_distance:
+                nearest_distance = center_distance
+                nearest_radius = float(obs.radius)
             min_clearance = min(min_clearance, clearance)
-        if min_clearance < 1.5:
-            reward -= 0.4 * (1.5 - min_clearance)
 
-        return float(reward)
+        return {
+            "nearest_obstacle_distance": nearest_distance,
+            "nearest_obstacle_radius": nearest_radius,
+            "min_obstacle_clearance": float(min_clearance),
+        }
+
+    def _line_tracking_metrics(self, pos: np.ndarray) -> Dict[str, float]:
+        mission_vec = self.target - self.start
+        mission_len = float(np.linalg.norm(mission_vec))
+        if mission_len < 1e-8:
+            return {
+                "cross_track_error": 0.0,
+                "path_progress_fraction": 0.0,
+            }
+
+        rel = pos - self.start
+        progress_unclipped = float(np.dot(rel, mission_vec) / (mission_len ** 2))
+        progress_fraction = float(np.clip(progress_unclipped, 0.0, 1.0))
+        closest = self.start + progress_fraction * mission_vec
+        return {
+            "cross_track_error": float(np.linalg.norm(pos - closest)),
+            "path_progress_fraction": progress_fraction,
+        }
+
+    def _heading_metrics(self, eta: np.ndarray, pos: np.ndarray) -> Dict[str, float]:
+        target_vec = self.target - pos
+        horizontal_dist = float(np.linalg.norm(target_vec[:2]))
+        desired_yaw = float(np.arctan2(target_vec[1], target_vec[0]))
+        desired_pitch = float(np.arctan2(target_vec[2], max(horizontal_dist, 1e-8)))
+        rot = rotation_matrix_body_to_inertial(eta[3], eta[4], eta[5])
+        body_x = rot[:, 0]
+        target_norm = float(np.linalg.norm(target_vec))
+        alignment = 0.0
+        if target_norm > 1e-8:
+            alignment = float(np.dot(body_x, target_vec) / target_norm)
+
+        return {
+            "target_bearing": desired_yaw,
+            "heading_error": float(wrap_angle(desired_yaw - eta[5])),
+            "target_elevation": desired_pitch,
+            "elevation_error": float(desired_pitch - eta[4]),
+            "target_alignment": alignment,
+        }
 
     # -------------------------------------------------
     # Gym API
@@ -573,7 +950,7 @@ class REMUSAUVEnv(gym.Env):
             self.rng = np.random.default_rng(seed)
 
         self.start = self.fixed_start.copy()
-        self.target = self.fixed_target.copy()
+        self.target = self._sample_target()
 
         eta = np.zeros(6, dtype=np.float64)
         eta[:3] = self.start
@@ -594,8 +971,16 @@ class REMUSAUVEnv(gym.Env):
         return self._get_obs(), {
             "start": self.start.copy(),
             "target": self.target.copy(),
-            "mission_distance": self.fixed_mission_distance,
+            "mission_distance": float(np.linalg.norm(self.target - self.start)),
+            "target_boundary_margin": float(self.target_boundary_margin),
+            "target_xy_margin": self._target_xy_margin(self.target),
+            "n_obstacles": int(len(self.obstacles)),
+            "seed": seed if seed is not None else "",
             "current_inertial": self.current_inertial.copy(),
+            **self._obstacle_arrays(),
+            "fixed_mid_obstacle": self.fixed_mid_obstacle,
+            "fixed_obstacle_radius": self.fixed_obstacle_radius if self.fixed_mid_obstacle else 0.0,
+            "fixed_obstacle_center": self.obstacles[0].center.copy() if self.fixed_mid_obstacle and len(self.obstacles) > 0 else None,
         }
 
     def step(self, action: np.ndarray):
@@ -608,43 +993,72 @@ class REMUSAUVEnv(gym.Env):
 
         clipped_action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         self._update_actuators(clipped_action)
-        nu_r, current_body = self._relative_velocity(eta, nu)
-        tau = self._control_to_tau(nu_r)
-        eta_next, nu_next = self._integrate(eta, nu, tau)
+        _, current_body = self._relative_velocity(eta, nu)
+        eta_next, nu_next = self._integrate(eta, nu)
 
         self.state = np.concatenate([eta_next, nu_next])
         self._update_obstacles()
 
         pos = eta_next[:3]
-        reward = self._reward(prev_pos, pos, clipped_action)
+        metrics = self._progress_metrics(prev_pos, pos)
+        step_distance = float(np.linalg.norm(pos - prev_pos))
+        obstacle_metrics = self._nearest_obstacle_metrics(pos)
+        line_metrics = self._line_tracking_metrics(pos)
+        heading_metrics = self._heading_metrics(eta_next, pos)
 
         terminated = False
         truncated = False
         info: Dict[str, Any] = {
-            "distance_to_goal": float(np.linalg.norm(pos - self.target)),
+            **metrics,
+            **obstacle_metrics,
+            **line_metrics,
+            **heading_metrics,
+            "step": int(self.step_count),
+            "sim_time": float(self.step_count * self.dt),
+            "step_distance": step_distance,
+            "position": pos.copy(),
+            "workspace_margin": self._workspace_margin(pos),
+            "velocity_body": nu_next.copy(),
+            "speed": float(np.linalg.norm(nu_next[:3])),
+            "surge_speed": float(nu_next[0]),
+            "sway_speed": float(nu_next[1]),
+            "heave_speed": float(nu_next[2]),
+            "roll": float(eta_next[3]),
+            "pitch": float(eta_next[4]),
+            "yaw": float(eta_next[5]),
+            "depth": float(pos[2]),
+            "target_depth_error": float(self.target[2] - pos[2]),
+            "n_obstacles": int(len(self.obstacles)),
             "current_inertial": self.current_inertial.copy(),
             "current_body": current_body.copy(),
+            **self._obstacle_arrays(),
             "actuator_state": self._normalized_actuator_state().copy(),
+            "propeller_rps": float(self.actuator_state[0]),
+            "goal_reached": False,
+            "collision": False,
+            "out_of_bounds": False,
+            "event": None,
         }
 
         if self._check_collision(pos):
-            reward -= 120.0
             terminated = True
+            info["collision"] = True
             info["event"] = "collision"
 
         if info["distance_to_goal"] <= self.goal_radius:
-            reward += 180.0
             terminated = True
+            info["goal_reached"] = True
             info["event"] = "goal"
 
         if self._out_of_bounds(pos):
-            reward -= 60.0
             terminated = True
+            info["out_of_bounds"] = True
             info["event"] = "out_of_bounds"
 
         if self.step_count >= self.max_steps:
             truncated = True
-            info["event"] = "timeout"
+            if info["event"] is None:
+                info["event"] = "timeout"
 
         self.last_action = clipped_action.copy()
-        return self._get_obs(), float(reward), terminated, truncated, info
+        return self._get_obs(), 0.0, terminated, truncated, info

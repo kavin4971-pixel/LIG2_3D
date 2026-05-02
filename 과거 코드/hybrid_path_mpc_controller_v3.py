@@ -1,3 +1,4 @@
++9
 from __future__ import annotations
 
 import argparse
@@ -24,6 +25,39 @@ DEFAULT_RESULT_ROOT = Path(r"C:\Users\kavin\Desktop\LIG2_result")
 RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 
 
+def format_vec3(vec: np.ndarray) -> str:
+    arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+    return f"({arr[0]:6.2f}, {arr[1]:6.2f}, {arr[2]:6.2f})"
+
+
+def maybe_print_progress(
+    *,
+    episode: int,
+    total_episodes: int,
+    env: REMUSAUVEnv,
+    episode_return: float,
+    step_info: Dict[str, Any],
+    log_prefix: str = "",
+) -> None:
+    pos = env.state[:3]
+    nu = env.state[6:]
+    dist = float(step_info.get("distance_to_goal", np.linalg.norm(pos - env.target)))
+    clearance = obstacle_clearance(pos, env.obstacles, env.auv_radius)
+    wall_margin = boundary_margin(pos, env.world_size)
+    action = env.last_action
+    actuator = step_info.get("actuator_state", env.actuator_state)
+    current_body = step_info.get("current_body", np.zeros(3, dtype=np.float64))
+    print(
+        f"{log_prefix}[ep {episode + 1:02d}/{total_episodes:02d} | step {env.step_count:04d}] "
+        f"dist={dist:6.2f} m | pos={format_vec3(pos)} | vel=({nu[0]:5.2f},{nu[1]:5.2f},{nu[2]:5.2f}) "
+        f"| act=({action[0]:4.2f},{action[1]:4.2f},{action[2]:4.2f}) "
+        f"| fin=({float(actuator[0]):4.2f},{float(actuator[1]):4.2f},{float(actuator[2]):4.2f}) "
+        f"| clr={clearance:5.2f} | wall={wall_margin:5.2f} | cur={format_vec3(current_body)} "
+        f"| R={episode_return:8.2f}",
+        flush=True,
+    )
+
+
 @dataclass
 class MPCConfig:
     plan_dt: float = 0.25
@@ -37,9 +71,9 @@ class MPCConfig:
     planner_prediction_time: float = 2.5
     obstacle_buffer: float = 1.6
     obstacle_influence: float = 9.0
-    boundary_margin: float = 3.0
-    boundary_influence: float = 8.0
-    waypoint_lookahead: float = 30.0
+    boundary_margin: float = 4.5
+    boundary_influence: float = 10.0
+    waypoint_lookahead: float = 24.0
     max_speed_cmd: float = 3.0
     min_speed_cmd: float = 0.80
     tau_speed: float = 0.9
@@ -74,12 +108,23 @@ class MPCConfig:
     heading_slowdown_gain: float = 0.30
     pitch_slowdown_gain: float = 0.22
     clearance_slowdown_range: float = 6.0
-    near_goal_relax_distance: float = 8.0
+    near_goal_relax_distance: float = 10.0
     warm_start_keep: int = 12
     timeout_speed_buffer: float = 0.25
     closing_speed_weight: float = 4.0
     turn_speed_floor: float = 1.20
     goal_bonus: float = 180.0
+    terminal_capture_distance: float = 18.0
+    terminal_sampling_distance: float = 22.0
+    terminal_speed_max: float = 1.05
+    terminal_min_speed: float = 0.05
+    terminal_waypoint_lookahead: float = 8.0
+    wall_recovery_margin: float = 8.0
+    wall_safe_margin: float = 6.0
+    wall_outward_speed_weight: float = 45.0
+    shortcut_boundary_margin: float = 8.0
+    shortcut_clearance_margin: float = 2.0
+    shortcut_max_factor: float = 1.25
 
 
 @dataclass
@@ -261,23 +306,39 @@ class GridPlanner3D:
         if not path:
             return goal.copy()
         lookahead_dist = float(self.cfg.waypoint_lookahead if lookahead is None else lookahead)
-        max_straight_dist = 1.8 * lookahead_dist
-        for point in reversed(path):
-            if np.linalg.norm(point - current_pos) > max_straight_dist:
-                continue
-            if self._segment_clear(current_pos, point, self.env.obstacles):
-                return point.copy()
 
+        # Follow the planned path conservatively by default. The previous version
+        # jumped to the farthest line-of-sight point, which often cut corners near
+        # the boundary and dynamic obstacles. Here we first choose the nominal
+        # along-path waypoint, then allow only modest straight-line shortcutting
+        # in clearly safe open water.
         cumulative = 0.0
         previous = current_pos
-        chosen = path[-1]
-        for point in path:
+        chosen_idx = len(path) - 1
+        for idx, point in enumerate(path):
             cumulative += np.linalg.norm(point - previous)
             previous = point
-            chosen = point
+            chosen_idx = idx
             if cumulative >= lookahead_dist:
                 break
-        return chosen.copy()
+
+        chosen = path[chosen_idx].copy()
+        wall_margin = boundary_margin(current_pos, self.env.world_size)
+        clear = obstacle_clearance(current_pos, self.env.obstacles, self.env.auv_radius)
+        max_straight_dist = self.cfg.shortcut_max_factor * lookahead_dist
+        if wall_margin < self.cfg.shortcut_boundary_margin or clear < (self.cfg.obstacle_influence + self.cfg.shortcut_clearance_margin):
+            return chosen
+
+        shortcut_idx = chosen_idx
+        for idx in range(chosen_idx + 1, len(path)):
+            point = path[idx]
+            if np.linalg.norm(point - current_pos) > max_straight_dist:
+                break
+            if self._segment_clear(current_pos, point, self.env.obstacles):
+                shortcut_idx = idx
+            else:
+                break
+        return path[shortcut_idx].copy()
 
 
 class PathGuidedSamplingMPC:
@@ -290,8 +351,10 @@ class PathGuidedSamplingMPC:
         self.cached_path: List[np.ndarray] = []
         self.cached_waypoint = np.zeros(3, dtype=np.float64)
         self.last_plan_step = -10_000
+        self.best_goal_dist = np.inf
         self.plan_substeps = max(1, int(round(self.cfg.plan_dt / self.env.dt)))
         self.plan_dt_effective = self.plan_substeps * self.env.dt
+        self.best_goal_dist = np.inf
 
     def reset(self) -> None:
         self.cached_actions.fill(0.0)
@@ -317,20 +380,37 @@ class PathGuidedSamplingMPC:
         clear = obstacle_clearance(pos, self.env.obstacles, self.env.auv_radius)
         goal_dist = float(np.linalg.norm(self.env.target - pos))
         wall_margin = boundary_margin(pos, self.env.world_size)
+        missed_capture = self._missed_capture(pos)
 
-        # For the fixed 120 m mission, cruise near the top speed when the path is
-        # open, then taper off only near the terminal zone.
+        if goal_dist <= self.cfg.terminal_capture_distance or missed_capture:
+            speed = min(self.cfg.terminal_speed_max, 0.35 + 0.06 * goal_dist)
+            if clear < self.cfg.clearance_slowdown_range:
+                speed *= np.clip(clear / self.cfg.clearance_slowdown_range, 0.45, 1.0)
+            if wall_margin < self.cfg.wall_recovery_margin:
+                speed *= np.clip(wall_margin / self.cfg.wall_recovery_margin, 0.30, 1.0)
+            if missed_capture:
+                speed = min(speed, 0.35)
+                return float(np.clip(speed, 0.0, self.cfg.terminal_speed_max))
+            if goal_dist <= self.cfg.terminal_sampling_distance:
+                speed = min(speed, self.cfg.terminal_speed_max + 0.07 * max(goal_dist - self.cfg.terminal_capture_distance, 0.0))
+            required = self._required_body_speed(pos, self.env.step_count)
+            if goal_dist > (2.0 * self.env.goal_radius):
+                speed = max(speed, min(self.cfg.terminal_speed_max, 0.85 * required))
+            return float(np.clip(speed, self.cfg.terminal_min_speed, self.cfg.terminal_speed_max))
+
         speed = self.cfg.max_speed_cmd
-        speed *= np.clip(goal_dist / 45.0, 0.68, 1.0)
+        speed *= np.clip(goal_dist / 45.0, 0.72, 1.0)
+        if goal_dist <= self.cfg.terminal_sampling_distance:
+            speed = min(speed, self.cfg.terminal_speed_max + 0.07 * max(goal_dist - self.cfg.terminal_capture_distance, 0.0))
         if clear < self.cfg.clearance_slowdown_range:
-            speed *= np.clip(clear / self.cfg.clearance_slowdown_range, 0.55, 1.0)
-        if wall_margin < self.cfg.boundary_influence:
-            speed *= np.clip(wall_margin / self.cfg.boundary_influence, 0.55, 1.0)
+            speed *= np.clip(clear / self.cfg.clearance_slowdown_range, 0.50, 1.0)
+        if wall_margin < max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin):
+            speed *= np.clip(wall_margin / max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin), 0.30, 1.0)
         speed *= 1.0 - 0.05 * abs(eta[4])
 
         if goal_dist > self.cfg.near_goal_relax_distance and clear > 1.5 and wall_margin > 1.5:
             speed = max(speed, self._required_body_speed(pos, self.env.step_count))
-        return float(np.clip(speed, self.cfg.min_speed_cmd, self.cfg.max_speed_cmd))
+        return float(np.clip(speed, self._dynamic_min_speed(pos), self.cfg.max_speed_cmd))
 
     def _goal_direction(self, pos: np.ndarray) -> np.ndarray:
         waypoint = self.cached_waypoint if self.cached_path else self.env.target
@@ -343,9 +423,76 @@ class PathGuidedSamplingMPC:
             return np.array([1.0, 0.0, 0.0], dtype=np.float64)
         return direction / norm
 
-    def _reference_angles(self, pos: np.ndarray) -> Tuple[float, float]:
+    def _wall_recovery_mode(self, pos: np.ndarray) -> bool:
+        return bool(boundary_margin(pos, self.env.world_size) < self.cfg.wall_recovery_margin)
+
+    def _missed_capture(self, pos: np.ndarray) -> bool:
+        goal_dist = float(np.linalg.norm(self.env.target - pos))
+        if goal_dist > self.cfg.terminal_sampling_distance:
+            return False
+        best_dist = self.best_goal_dist if np.isfinite(self.best_goal_dist) else goal_dist
+        return bool(best_dist <= 4.0 and goal_dist > best_dist + 0.75)
+
+    def _wall_push_vector(self, pos: np.ndarray) -> np.ndarray:
+        trigger = max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin)
+        push = np.zeros(3, dtype=np.float64)
+        xy_margin = self.env.world_size - np.abs(pos[:2])
+        for axis in range(2):
+            if xy_margin[axis] < trigger:
+                strength = (trigger - xy_margin[axis]) / max(trigger, 1e-6)
+                push[axis] += -np.sign(pos[axis]) * strength
+        if pos[2] < trigger:
+            push[2] += (trigger - pos[2]) / max(trigger, 1e-6)
+        top_margin = self.env.world_size - pos[2]
+        if top_margin < trigger:
+            push[2] -= (trigger - top_margin) / max(trigger, 1e-6)
+        return push
+
+    def _reference_angles(self, pos: np.ndarray, desired_speed: float) -> Tuple[float, float]:
         direction = self._goal_direction(pos)
-        return course_to_angles(direction)
+        desired_ground = desired_speed * direction
+        current = self._current_from_profile(self.env.step_count)
+
+        comp_gain = 0.90
+        if self._terminal_mode(pos) or self._wall_recovery_mode(pos) or self._missed_capture(pos):
+            comp_gain = 1.05
+        desired_rel = desired_ground - comp_gain * current
+
+        wall_push = self._wall_push_vector(pos)
+        if np.linalg.norm(wall_push) > 1e-8:
+            desired_rel = desired_rel + 1.10 * max(desired_speed, 0.6) * wall_push
+
+        if np.linalg.norm(desired_rel) < 1e-6:
+            desired_rel = desired_ground
+        return course_to_angles(desired_rel)
+
+    def _outward_speed(self, pos: np.ndarray, vel_inertial: np.ndarray) -> float:
+        outward = 0.0
+        xy_margin = self.env.world_size - np.abs(pos[:2])
+        for axis in range(2):
+            if xy_margin[axis] < self.cfg.wall_recovery_margin:
+                outward = max(outward, float(np.sign(pos[axis]) * vel_inertial[axis]))
+        if pos[2] < self.cfg.wall_recovery_margin:
+            outward = max(outward, float(-vel_inertial[2]))
+        if (self.env.world_size - pos[2]) < self.cfg.wall_recovery_margin:
+            outward = max(outward, float(vel_inertial[2]))
+        return max(0.0, outward)
+
+    def _terminal_mode(self, pos: np.ndarray) -> bool:
+        return bool(np.linalg.norm(self.env.target - pos) <= self.cfg.terminal_capture_distance)
+
+    def _terminal_waypoint(self, pos: np.ndarray) -> np.ndarray:
+        return self.env.target.copy()
+
+    def _dynamic_min_speed(self, pos: np.ndarray) -> float:
+        goal_dist = float(np.linalg.norm(self.env.target - pos))
+        wall_margin = boundary_margin(pos, self.env.world_size)
+        clear = obstacle_clearance(pos, self.env.obstacles, self.env.auv_radius)
+        if goal_dist <= self.cfg.terminal_sampling_distance or self._missed_capture(pos):
+            return 0.0
+        if wall_margin < self.cfg.wall_recovery_margin or clear < 1.2:
+            return 0.0
+        return self.cfg.min_speed_cmd
 
     def _warm_start_mean(self, nominal_action: np.ndarray) -> np.ndarray:
         mean = np.zeros((self.cfg.horizon, 3), dtype=np.float64)
@@ -374,7 +521,17 @@ class PathGuidedSamplingMPC:
             if self.cfg.horizon > 1:
                 noise[:, 1:, :] = 0.65 * noise[:, 1:, :] + 0.35 * noise[:, :-1, :]
             samples = current_mean[None, :, :] + noise
-            samples[:, :, 0] = np.clip(samples[:, :, 0], 0.25, 1.0)
+
+            current_pos = self.env.state[:3]
+            wall_margin = boundary_margin(current_pos, self.env.world_size)
+            goal_dist = float(np.linalg.norm(self.env.target - current_pos))
+            prop_floor = 0.15
+            if goal_dist <= self.cfg.terminal_sampling_distance or wall_margin < (self.cfg.wall_recovery_margin + 1.5):
+                prop_floor = 0.0
+            if self._terminal_mode(current_pos) or self._missed_capture(current_pos) or wall_margin < self.cfg.wall_recovery_margin:
+                prop_floor = -0.12
+
+            samples[:, :, 0] = np.clip(samples[:, :, 0], prop_floor, 1.0)
             samples[:, :, 1] = np.clip(samples[:, :, 1], -1.0, 1.0)
             samples[:, :, 2] = np.clip(samples[:, :, 2], -1.0, 1.0)
             samples[0] = current_mean
@@ -532,6 +689,7 @@ class PathGuidedSamplingMPC:
         prev_action = self.env.last_action.copy()
         prev_pos = eta[:3].copy()
         initial_goal_dist = float(np.linalg.norm(prev_pos - target))
+        best_rollout_goal = initial_goal_dist
         total_cost = 0.0
 
         for action in sequence:
@@ -547,6 +705,8 @@ class PathGuidedSamplingMPC:
             pos = eta[:3]
             dist_wp = float(np.linalg.norm(pos - waypoint))
             dist_goal = float(np.linalg.norm(pos - target))
+            best_rollout_goal = min(best_rollout_goal, dist_goal)
+            missed_capture = bool(best_rollout_goal <= 4.0 and dist_goal > best_rollout_goal + 0.75)
             progress = float(np.linalg.norm(prev_pos - target) - dist_goal)
             prev_pos = pos.copy()
 
@@ -556,7 +716,6 @@ class PathGuidedSamplingMPC:
             desired_yaw, desired_pitch = course_to_angles(waypoint - pos)
             total_cost += self.cfg.attitude_weight * (abs(eta[4] - desired_pitch) + 0.35 * abs(wrap_angle(eta[5] - desired_yaw)))
             total_cost += self.cfg.smooth_weight * np.sum((action - prev_action) ** 2)
-            total_cost += 0.12 * (0.95 - float(action[0])) ** 2
             prev_action = np.asarray(action, dtype=np.float64)
 
             time_left = max((self.env.max_steps - step_count) * self.env.dt, self.plan_dt_effective)
@@ -565,6 +724,16 @@ class PathGuidedSamplingMPC:
             if dist_goal > self.cfg.near_goal_relax_distance:
                 deficit = max(0.0, required_closing - closing_speed)
                 total_cost += self.cfg.closing_speed_weight * (deficit ** 2) * self.plan_dt_effective
+            else:
+                terminal_target_speed = min(self.cfg.terminal_speed_max, 0.30 + 0.07 * dist_goal)
+                total_cost += 0.18 * (float(action[0]) - min(1.0, terminal_target_speed / max(self.cfg.max_speed_cmd, 1e-6))) ** 2
+                if dist_goal > self.env.goal_radius:
+                    total_cost += 2.8 * max(0.0, 0.22 - closing_speed) ** 2
+                if dist_goal <= self.cfg.terminal_sampling_distance:
+                    prop_cap = 0.20 if not missed_capture else 0.05
+                    total_cost += 0.45 * max(0.0, float(action[0]) - prop_cap) ** 2
+                if missed_capture:
+                    total_cost += 2.5 * (dist_goal - best_rollout_goal) ** 2
 
             clear = obstacle_clearance(pos, obstacles, self.env.auv_radius)
             if clear < self.cfg.obstacle_influence:
@@ -578,6 +747,14 @@ class PathGuidedSamplingMPC:
             b_margin = boundary_margin(pos, self.env.world_size)
             if b_margin < self.cfg.boundary_influence:
                 total_cost += self.cfg.boundary_weight * (self.cfg.boundary_influence - b_margin) ** 2
+            vel_inertial = rotation_matrix_body_to_inertial(eta[3], eta[4], eta[5]) @ nu[:3]
+            outward_speed = self._outward_speed(pos, vel_inertial)
+            recovery_influence = max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin + 1.5)
+            if b_margin < recovery_influence and outward_speed > 0.0:
+                total_cost += self.cfg.wall_outward_speed_weight * (recovery_influence - b_margin) * (outward_speed ** 2)
+            if b_margin < self.cfg.wall_recovery_margin:
+                wall_prop_cap = 0.18 if outward_speed < 0.05 else 0.05
+                total_cost += 0.40 * max(0.0, float(action[0]) - wall_prop_cap) ** 2
             if b_margin < 0.0:
                 total_cost += self.cfg.oob_penalty
                 break
@@ -594,40 +771,68 @@ class PathGuidedSamplingMPC:
     def _low_level_action(self, desired_speed: float, desired_yaw: float, desired_pitch: float) -> np.ndarray:
         eta = self.env.state[:6]
         nu = self.env.state[6:]
-        desired_ground = desired_speed * rotation_matrix_yaw_pitch(desired_yaw, desired_pitch)
-        yaw_cmd, pitch_cmd = course_to_angles(desired_ground)
+        yaw_cmd = wrap_angle(desired_yaw)
+        pitch_cmd = float(np.clip(desired_pitch, -0.45, 0.45))
         yaw_error = wrap_angle(yaw_cmd - eta[5])
-        pitch_cmd = np.clip(pitch_cmd, -0.45, 0.45)
 
         pitch_error_term = eta[4] - pitch_cmd
         clear = obstacle_clearance(eta[:3], self.env.obstacles, self.env.auv_radius)
         wall_margin = boundary_margin(eta[:3], self.env.world_size)
         goal_dist = float(np.linalg.norm(self.env.target - eta[:3]))
+        missed_capture = self._missed_capture(eta[:3])
+        vel_inertial = rotation_matrix_body_to_inertial(eta[3], eta[4], eta[5]) @ nu[:3]
+        outward_speed = self._outward_speed(eta[:3], vel_inertial)
 
         speed_cap = desired_speed
         speed_cap /= 1.0 + self.cfg.heading_slowdown_gain * abs(yaw_error)
         speed_cap /= 1.0 + self.cfg.pitch_slowdown_gain * abs(pitch_error_term)
         if abs(yaw_error) > 0.95:
-            speed_cap *= 0.62
+            speed_cap *= 0.52
         elif abs(yaw_error) > 0.55:
-            speed_cap *= 0.78
+            speed_cap *= 0.70
         if abs(pitch_error_term) > 0.30:
-            speed_cap *= 0.74
+            speed_cap *= 0.70
         if clear < self.cfg.clearance_slowdown_range:
-            speed_cap *= np.clip(clear / self.cfg.clearance_slowdown_range, 0.40, 1.0)
-        if wall_margin < self.cfg.boundary_influence:
-            speed_cap *= np.clip(wall_margin / self.cfg.boundary_influence, 0.40, 1.0)
-        if goal_dist > self.cfg.near_goal_relax_distance and clear > 1.2 and wall_margin > 1.2:
+            speed_cap *= np.clip(clear / self.cfg.clearance_slowdown_range, 0.35, 1.0)
+        if wall_margin < max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin):
+            speed_cap *= np.clip(wall_margin / max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin), 0.22, 1.0)
+        if wall_margin < self.cfg.wall_recovery_margin and outward_speed > 0.05:
+            speed_cap *= 1.0 / (1.0 + 1.25 * outward_speed)
+        if goal_dist <= self.cfg.terminal_sampling_distance:
+            speed_cap = min(speed_cap, self.cfg.terminal_speed_max + 0.08 * max(goal_dist - self.cfg.terminal_capture_distance, 0.0))
+        if missed_capture:
+            speed_cap = min(speed_cap, 0.35)
+        if wall_margin < self.cfg.wall_recovery_margin and outward_speed > 0.05:
+            speed_cap = min(speed_cap, 0.45)
+
+        min_speed = self._dynamic_min_speed(eta[:3])
+        if goal_dist > self.cfg.near_goal_relax_distance and clear > 1.2 and wall_margin > self.cfg.wall_safe_margin:
             speed_cap = max(speed_cap, min(self.cfg.turn_speed_floor, desired_speed))
-        speed_cap = float(np.clip(speed_cap, self.cfg.min_speed_cmd, self.cfg.max_speed_cmd))
+        speed_cap = float(np.clip(speed_cap, min_speed, self.cfg.max_speed_cmd))
+
+        recover_mode = missed_capture or goal_dist <= self.cfg.terminal_capture_distance or wall_margin < self.cfg.wall_recovery_margin
+        yaw_kp = self.cfg.yaw_kp * (1.30 if recover_mode else 1.0)
+        pitch_kp = self.cfg.pitch_kp * (1.15 if goal_dist <= self.cfg.terminal_capture_distance else 1.0)
 
         propeller = (
             self.cfg.prop_base
             + self.cfg.prop_speed_kp * (speed_cap / self.cfg.max_speed_cmd)
             + self.cfg.prop_surge_kp * (speed_cap - nu[0])
         )
-        rudder = self.cfg.yaw_kp * yaw_error - self.cfg.yaw_rate_kd * nu[5] - self.cfg.sway_kd * nu[1]
-        stern = self.cfg.pitch_kp * pitch_error_term + self.cfg.pitch_rate_kd * nu[4] + self.cfg.heave_kd * nu[2]
+        brake = 0.0
+        if goal_dist <= self.cfg.terminal_sampling_distance:
+            brake += 0.40 * max(0.0, abs(yaw_error) - 0.25)
+        if missed_capture:
+            overshoot = max(0.0, goal_dist - self.best_goal_dist) if np.isfinite(self.best_goal_dist) else 0.0
+            brake += 0.75 * (0.20 + overshoot + 0.35 * abs(yaw_error))
+        if wall_margin < (self.cfg.wall_recovery_margin + 1.5):
+            brake += 0.30 * max(0.0, outward_speed)
+        if wall_margin < self.cfg.wall_recovery_margin and outward_speed > 0.03:
+            brake += 0.55 * (0.20 + outward_speed + 0.12 * max(0.0, self.cfg.wall_recovery_margin - wall_margin))
+        propeller -= brake
+
+        rudder = yaw_kp * yaw_error - self.cfg.yaw_rate_kd * nu[5] - self.cfg.sway_kd * nu[1]
+        stern = pitch_kp * pitch_error_term + self.cfg.pitch_rate_kd * nu[4] + self.cfg.heave_kd * nu[2]
 
         action = np.array(
             [
@@ -645,9 +850,19 @@ class PathGuidedSamplingMPC:
         pos = self.env.state[:3]
         goal_dist = float(np.linalg.norm(self.env.target - pos))
         clear = obstacle_clearance(pos, self.env.obstacles, self.env.auv_radius)
+        wall_margin = boundary_margin(pos, self.env.world_size)
+        if goal_dist <= self.cfg.terminal_sampling_distance:
+            self.cached_path = [self.env.target.copy()]
+            self.cached_waypoint = self._terminal_waypoint(pos)
+            self.last_plan_step = int(self.env.step_count)
+            return
+
         lookahead = self.cfg.waypoint_lookahead
-        if clear > self.cfg.clearance_slowdown_range and goal_dist > 2.0 * self.cfg.waypoint_lookahead:
-            lookahead = min(1.45 * self.cfg.waypoint_lookahead, self.cfg.waypoint_lookahead + 0.12 * goal_dist)
+        if clear > self.cfg.clearance_slowdown_range and goal_dist > 2.0 * self.cfg.waypoint_lookahead and wall_margin > self.cfg.shortcut_boundary_margin:
+            lookahead = min(1.20 * self.cfg.waypoint_lookahead, self.cfg.waypoint_lookahead + 0.06 * goal_dist)
+        if wall_margin < (self.cfg.wall_recovery_margin + 1.5):
+            lookahead = min(lookahead, 0.65 * self.cfg.waypoint_lookahead)
+
         self.cached_path = self.planner.plan(pos, self.env.target, self.env.obstacles)
         self.cached_waypoint = self.planner.pick_waypoint(self.cached_path, pos, self.env.target, lookahead=lookahead)
         self.last_plan_step = int(self.env.step_count)
@@ -655,18 +870,23 @@ class PathGuidedSamplingMPC:
     def _sampling_needed(self, pos: np.ndarray) -> bool:
         clear = obstacle_clearance(pos, self.env.obstacles, self.env.auv_radius)
         wall_margin = boundary_margin(pos, self.env.world_size)
+        goal_dist = float(np.linalg.norm(self.env.target - pos))
         return bool(
             clear < (self.cfg.obstacle_influence + 1.0)
-            or wall_margin < (self.cfg.boundary_influence + 1.0)
+            or wall_margin < max(self.cfg.boundary_influence, self.cfg.wall_recovery_margin)
+            or goal_dist < self.cfg.terminal_sampling_distance
         )
 
     def act(self) -> np.ndarray:
+        pos = self.env.state[:3]
+        self.best_goal_dist = min(self.best_goal_dist, float(np.linalg.norm(self.env.target - pos)))
+
         self._maybe_replan_path()
 
         pos = self.env.state[:3]
         eta = self.env.state[:6]
         speed_ref = self._reference_speed(pos, eta)
-        ref_yaw, ref_pitch = self._reference_angles(pos)
+        ref_yaw, ref_pitch = self._reference_angles(pos, speed_ref)
         nominal_action = self._low_level_action(speed_ref, ref_yaw, ref_pitch).astype(np.float64)
 
         if not self._sampling_needed(pos):
@@ -676,7 +896,16 @@ class PathGuidedSamplingMPC:
         mean = self._warm_start_mean(nominal_action)
         best_sequence = self._sample_action_sequences(mean)
         self.cached_actions = best_sequence.copy()
-        blended = 0.75 * nominal_action + 0.25 * best_sequence[0]
+
+        if self._missed_capture(pos):
+            blend_nominal = 0.25
+        elif self._terminal_mode(pos):
+            blend_nominal = 0.40
+        elif boundary_margin(pos, self.env.world_size) < self.cfg.wall_recovery_margin:
+            blend_nominal = 0.45
+        else:
+            blend_nominal = 0.72
+        blended = blend_nominal * nominal_action + (1.0 - blend_nominal) * best_sequence[0]
         blended[0] = np.clip(blended[0], -self.env.max_reverse_propeller, 1.0)
         blended[1:] = np.clip(blended[1:], -1.0, 1.0)
         return np.asarray(blended, dtype=np.float32)
@@ -736,6 +965,15 @@ def evaluate_controller(args: argparse.Namespace) -> Dict[str, Any]:
         path_log: List[List[float]] = [env.state[:3].astype(float).tolist()]
         obstacle_log: List[List[List[float]]] = []
 
+        if not args.quiet:
+            print(
+                f"\n=== Episode {episode + 1}/{args.episodes} | seed={env_seed} ===\n"
+                f"start={format_vec3(env.start)} | target={format_vec3(env.target)} "
+                f"| init_dist={np.linalg.norm(env.target - env.start):.2f} m "
+                f"| current={format_vec3(info.get('current_inertial', np.zeros(3)))}",
+                flush=True,
+            )
+
         for _ in range(env.max_steps):
             action = controller.act()
             obs, reward, terminated, truncated, step_info = env.step(action)
@@ -743,8 +981,27 @@ def evaluate_controller(args: argparse.Namespace) -> Dict[str, Any]:
             episode_return += float(reward)
             path_log.append(env.state[:3].astype(float).tolist())
             obstacle_log.append([obs_item.center.astype(float).tolist() for obs_item in env.obstacles])
+
+            if (not args.quiet) and args.log_every > 0 and (env.step_count == 1 or env.step_count % args.log_every == 0):
+                maybe_print_progress(
+                    episode=episode,
+                    total_episodes=args.episodes,
+                    env=env,
+                    episode_return=episode_return,
+                    step_info=step_info,
+                )
+
             if terminated or truncated:
                 event = str(step_info.get("event", "timeout" if truncated else "other"))
+                if not args.quiet:
+                    maybe_print_progress(
+                        episode=episode,
+                        total_episodes=args.episodes,
+                        env=env,
+                        episode_return=episode_return,
+                        step_info=step_info,
+                        log_prefix=f"[{event.upper()}] ",
+                    )
                 break
 
         final_dist = float(np.linalg.norm(env.state[:3] - env.target))
@@ -759,6 +1016,13 @@ def evaluate_controller(args: argparse.Namespace) -> Dict[str, Any]:
                 distance_to_goal=final_dist,
             )
         )
+
+        if not args.quiet:
+            print(
+                f"--- Episode {episode + 1}/{args.episodes} done | event={event} | steps={env.step_count} "
+                f"| final_dist={final_dist:.2f} m | return={episode_return:.2f} ---",
+                flush=True,
+            )
 
         if run_dir is not None and args.save_trajectories:
             trajectories.append(
@@ -852,7 +1116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cem-iters", type=int, default=2, help="Number of CEM updates per MPC step.")
     parser.add_argument("--grid-resolution-xy", type=float, default=6.0, help="Planner XY grid resolution.")
     parser.add_argument("--grid-resolution-z", type=float, default=5.0, help="Planner Z grid resolution.")
-    parser.add_argument("--waypoint-lookahead", type=float, default=30.0, help="Distance used to select the path waypoint.")
+    parser.add_argument("--waypoint-lookahead", type=float, default=24.0, help="Distance used to select the path waypoint.")
+    parser.add_argument("--log-every", type=int, default=100, help="Print progress every N environment steps. Set 0 to disable periodic step logs.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-episode progress logs and only print the final summary.")
     return parser.parse_args()
 
 
